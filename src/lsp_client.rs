@@ -262,6 +262,7 @@ impl LspClient {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::null());
         cmd.current_dir(&workspace);
+        cmd.kill_on_drop(true);
 
         let mut child = cmd
             .spawn()
