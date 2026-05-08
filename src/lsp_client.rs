@@ -323,6 +323,13 @@ impl LspClient {
         let path_buf = path.to_path_buf();
         let content = content.to_string();
 
+        // Validate path BEFORE removing connection from pool — parameter
+        // errors (e.g. Url::from_file_path on a relative path) should not
+        // kill a healthy LSP server.
+        let uri = Url::from_file_path(&path_buf)
+            .map(|u| u.to_string())
+            .map_err(|_| anyhow!("Invalid file path for LSP"))?;
+
         // Extract connection from pool (no lock held during I/O)
         let conn = {
             let mut servers = self.servers.lock().unwrap();
@@ -335,10 +342,6 @@ impl LspClient {
         };
 
         let result = timeout(Duration::from_secs(10), async {
-            let uri = Url::from_file_path(&path_buf)
-                .map(|u| u.to_string())
-                .map_err(|_| anyhow!("Invalid file path for LSP"))?;
-
             let params = serde_json::json!({
                 "textDocument": {
                     "uri": uri,
@@ -359,6 +362,8 @@ impl LspClient {
                 Ok(())
             }
             Ok(Err(e)) => {
+                // Only kill on genuine I/O or protocol errors — parameter
+                // validation errors were caught above and never removed the conn.
                 let _ = conn.process.kill().await;
                 Err(e)
             }
@@ -383,6 +388,11 @@ impl LspClient {
         let path_buf = path.to_path_buf();
         let content = content.to_string();
 
+        // Validate path BEFORE removing connection from pool
+        let uri = Url::from_file_path(&path_buf)
+            .map(|u| u.to_string())
+            .map_err(|_| anyhow!("Invalid file path for LSP"))?;
+
         // Extract connection from pool
         let conn = {
             let mut servers = self.servers.lock().unwrap();
@@ -395,10 +405,6 @@ impl LspClient {
         };
 
         let result = timeout(Duration::from_secs(10), async {
-            let uri = Url::from_file_path(&path_buf)
-                .map(|u| u.to_string())
-                .map_err(|_| anyhow!("Invalid file path for LSP"))?;
-
             let params = serde_json::json!({
                 "textDocument": {
                     "uri": uri,
@@ -441,6 +447,11 @@ impl LspClient {
         let lang = language.to_string();
         let path_buf = path.to_path_buf();
 
+        // Validate path BEFORE removing connection from pool
+        let uri = Url::from_file_path(&path_buf)
+            .map(|u| u.to_string())
+            .map_err(|_| anyhow!("Invalid file path for LSP"))?;
+
         let conn = {
             let mut servers = self.servers.lock().unwrap();
             servers.remove(&lang)
@@ -452,11 +463,8 @@ impl LspClient {
         };
 
         let result = timeout(Duration::from_secs(30), async {
-            let uri = Url::from_file_path(&path_buf)
-                .map_err(|_| anyhow!("Invalid file path for LSP"))?;
-
             let params = serde_json::json!({
-                "textDocument": { "uri": uri.to_string() },
+                "textDocument": { "uri": uri },
                 "position": { "line": line, "character": column },
                 "context": { "includeDeclaration": include_declaration }
             });
@@ -497,6 +505,11 @@ impl LspClient {
         let lang = language.to_string();
         let path_buf = path.to_path_buf();
 
+        // Validate path BEFORE removing connection from pool
+        let uri = Url::from_file_path(&path_buf)
+            .map(|u| u.to_string())
+            .map_err(|_| anyhow!("Invalid file path for LSP"))?;
+
         let conn = {
             let mut servers = self.servers.lock().unwrap();
             servers.remove(&lang)
@@ -508,11 +521,8 @@ impl LspClient {
         };
 
         let result = timeout(Duration::from_secs(15), async {
-            let uri = Url::from_file_path(&path_buf)
-                .map_err(|_| anyhow!("Invalid file path for LSP"))?;
-
             let params = serde_json::json!({
-                "textDocument": { "uri": uri.to_string() },
+                "textDocument": { "uri": uri },
                 "position": { "line": line, "character": column }
             });
 
@@ -563,6 +573,11 @@ impl LspClient {
         let lang = language.to_string();
         let path_buf = path.to_path_buf();
 
+        // Validate path BEFORE removing connection from pool
+        let uri = Url::from_file_path(&path_buf)
+            .map(|u| u.to_string())
+            .map_err(|_| anyhow!("Invalid file path for LSP"))?;
+
         let conn = {
             let mut servers = self.servers.lock().unwrap();
             servers.remove(&lang)
@@ -574,11 +589,8 @@ impl LspClient {
         };
 
         let result = timeout(Duration::from_secs(15), async {
-            let uri = Url::from_file_path(&path_buf)
-                .map_err(|_| anyhow!("Invalid file path for LSP"))?;
-
             let params = serde_json::json!({
-                "textDocument": { "uri": uri.to_string() },
+                "textDocument": { "uri": uri },
                 "position": { "line": line, "character": column }
             });
 
@@ -624,6 +636,11 @@ impl LspClient {
         let lang = language.to_string();
         let path_buf = path.to_path_buf();
 
+        // Validate path BEFORE removing connection from pool
+        let uri = Url::from_file_path(&path_buf)
+            .map(|u| u.to_string())
+            .map_err(|_| anyhow!("Invalid file path for LSP"))?;
+
         let conn = {
             let mut servers = self.servers.lock().unwrap();
             servers.remove(&lang)
@@ -635,11 +652,8 @@ impl LspClient {
         };
 
         let result = timeout(Duration::from_secs(15), async {
-            let uri = Url::from_file_path(&path_buf)
-                .map_err(|_| anyhow!("Invalid file path for LSP"))?;
-
             let params = serde_json::json!({
-                "textDocument": { "uri": uri.to_string() },
+                "textDocument": { "uri": uri },
                 "position": { "line": line, "character": column }
             });
 
