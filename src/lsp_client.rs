@@ -363,7 +363,8 @@ impl LspClient {
                 Err(e)
             }
             Err(_elapsed) => {
-                // Timeout — connection dropped (process killed)
+                // Timeout — kill process before dropping connection
+                let _ = conn.process.kill().await;
                 warn!(language = lang.as_str(), "LSP open_document timed out, server will restart on demand");
                 Err(anyhow!("LSP open_document timed out"))
             }
