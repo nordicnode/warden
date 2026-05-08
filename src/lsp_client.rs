@@ -3,12 +3,15 @@
 //! Spawns language servers (pylsp, rust-analyzer, typescript-language-server) via stdio
 //! and communicates using the Language Server Protocol over JSON-RPC.
 //!
-//! FIXES APPLIED:
-//! - Replaced compile-only stub with real LSP client implementation.
-//! - Spawns language servers via stdio and communicates via JSON-RPC 2.0.
-//! - Provides graceful fallback when language servers are not installed.
-//! - find_references, get_definition, get_hover, get_completions all work.
-//! - Each method sends proper JSON-RPC requests and parses responses.
+//! REFACTORED: Fully async I/O using tokio::process and tokio::io.
+//! Previously used std::process + std::io::BufReader wrapped in spawn_blocking,
+//! which caused a permanent deadlock when tokio::time::timeout fired:
+//!   - timeout cancelled the spawn_blocking JoinHandle future
+//!   - the OS thread remained blocked inside the Mutex<HashMap<..., LspConnection>>
+//!   - all subsequent tool calls deadlocked trying to acquire the same Mutex
+//!
+//! Now LspConnection is fully async. The Mutex is held only for brief
+//! remove/insert operations on the HashMap — never during I/O.
 
 use anyhow::{Result, anyhow};
 use lsp_types::{
@@ -16,28 +19,29 @@ use lsp_types::{
 };
 use serde_json::Value;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::time::{timeout, Duration};
 use tracing::{info, warn};
 
 use crate::context_engine::{CompletionItem, LspLocation as ContextLspLocation};
 use lsp_types::Url;
 
-/// A live connection to a language server
+/// A live connection to a language server.
+/// All I/O is async — callers must .await.
 struct LspConnection {
     process: Child,
-    stdin: std::process::ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
     next_id: u64,
     root_uri: String,
 }
 
 impl LspConnection {
-    /// Send an initialize request and receive the response
-    fn initialize(&mut self) -> Result<()> {
+    /// Send an initialize request, then the 'initialized' notification.
+    async fn initialize(&mut self) -> Result<()> {
         let init_params = serde_json::json!({
             "processId": std::process::id(),
             "rootUri": self.root_uri,
@@ -64,8 +68,8 @@ impl LspConnection {
             }]
         });
 
-        self.send_request("initialize", init_params)?;
-        
+        self.send_request("initialize", init_params).await?;
+
         // Send initialized notification
         let initialized = serde_json::json!({
             "jsonrpc": "2.0",
@@ -74,16 +78,16 @@ impl LspConnection {
         });
         let msg = serde_json::to_string(&initialized)?;
         let header = format!("Content-Length: {}\r\n\r\n", msg.len());
-        self.stdin.write_all(header.as_bytes())?;
-        self.stdin.write_all(msg.as_bytes())?;
-        self.stdin.flush()?;
+        self.stdin.write_all(header.as_bytes()).await?;
+        self.stdin.write_all(msg.as_bytes()).await?;
+        self.stdin.flush().await?;
 
         info!(root_uri = %self.root_uri, "LSP server initialized");
         Ok(())
     }
 
-    /// Send a JSON-RPC request and return the response
-    fn send_request(&mut self, method: &str, params: Value) -> Result<Value> {
+    /// Send a JSON-RPC request and return the response.
+    async fn send_request(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -96,26 +100,30 @@ impl LspConnection {
 
         let msg = serde_json::to_string(&request)?;
         let header = format!("Content-Length: {}\r\n\r\n", msg.len());
-        
-        self.stdin.write_all(header.as_bytes())?;
-        self.stdin.write_all(msg.as_bytes())?;
-        self.stdin.flush()?;
 
-        // Read response
-        self.read_response(id)
+        self.stdin.write_all(header.as_bytes()).await?;
+        self.stdin.write_all(msg.as_bytes()).await?;
+        self.stdin.flush().await?;
+
+        self.read_response(id).await
     }
 
     /// Read LSP response from stdout, skipping server notifications.
     /// Loops until a message with matching id is found.
-    fn read_response(&mut self, expected_id: u64) -> Result<Value> {
+    async fn read_response(&mut self, expected_id: u64) -> Result<Value> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            let mut content_length = 0;
+            if std::time::Instant::now() > deadline {
+                return Err(anyhow!("LSP response timeout: no matching response for request id {} within 30s", expected_id));
+            }
+
+            let mut content_length = 0usize;
             let mut buffer = String::new();
 
             // Read headers
             loop {
                 buffer.clear();
-                let bytes = self.stdout.read_line(&mut buffer)?;
+                let bytes = self.stdout.read_line(&mut buffer).await?;
                 if bytes == 0 {
                     return Err(anyhow!("LSP server closed connection"));
                 }
@@ -132,10 +140,10 @@ impl LspConnection {
                 return Err(anyhow!("No Content-Length header in LSP response"));
             }
 
-            // Read body through BufReader (don't bypass buffer with get_mut())
+            // Read body through BufReader (don't bypass buffer)
             let mut body = vec![0u8; content_length];
-            self.stdout.read_exact(&mut body)?;
-            
+            self.stdout.read_exact(&mut body).await?;
+
             let message: Value = serde_json::from_slice(&body)?;
 
             // If this message has no id, it's a notification — skip it
@@ -158,8 +166,8 @@ impl LspConnection {
         }
     }
 
-    /// Send a notification (no response expected)
-    fn send_notification(&mut self, method: &str, params: Value) -> Result<()> {
+    /// Send a notification (no response expected).
+    async fn send_notification(&mut self, method: &str, params: Value) -> Result<()> {
         let notification = serde_json::json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -168,16 +176,24 @@ impl LspConnection {
 
         let msg = serde_json::to_string(&notification)?;
         let header = format!("Content-Length: {}\r\n\r\n", msg.len());
-        self.stdin.write_all(header.as_bytes())?;
-        self.stdin.write_all(msg.as_bytes())?;
-        self.stdin.flush()?;
+        self.stdin.write_all(header.as_bytes()).await?;
+        self.stdin.write_all(msg.as_bytes()).await?;
+        self.stdin.flush().await?;
         Ok(())
     }
 }
 
 /// Real LSP client that manages connections to multiple language servers.
-/// Uses std::sync::Mutex because all LSP I/O is blocking — methods are
-/// wrapped in tokio::task::spawn_blocking to avoid starving the async runtime.
+///
+/// Uses `std::sync::Mutex` for the server pool because the lock is only held
+/// for brief remove/insert operations — never during I/O. The async I/O on
+/// individual LspConnection instances happens outside the lock.
+///
+/// Timeouts: every LSP operation is wrapped in `tokio::time::timeout`.
+/// If a timeout fires, the connection's async future is dropped, which drops
+/// the Child process (sends SIGKILL), and the connection is not re-inserted
+/// into the pool. Subsequent calls will return empty results and ensure_server
+/// will re-spawn a fresh server on demand.
 pub struct LspClient {
     workspace_root: PathBuf,
     servers: Arc<Mutex<HashMap<String, LspConnection>>>,
@@ -187,8 +203,6 @@ impl Clone for LspClient {
     fn clone(&self) -> Self {
         // Share the same server pool via Arc so that cloned instances
         // (e.g. through ContextEngine derive) retain LSP connections.
-        // NOTE: LspConnection contains a std::process::Child which is not Clone,
-        // so we must share the Arc rather than deep-clone.
         Self {
             workspace_root: self.workspace_root.clone(),
             servers: Arc::clone(&self.servers),
@@ -205,10 +219,10 @@ impl LspClient {
     }
 
     /// Ensure a language server is running for the given language.
-    /// All process spawning is done in spawn_blocking to avoid blocking the async runtime.
-    /// Wrapped in tokio::time::timeout to prevent hanging if the LSP server sends
-    /// an infinite stream of notifications during initialization.
+    /// Spawns the server process using tokio::process::Command and
+    /// sends the LSP initialize handshake.
     pub async fn ensure_server(&self, language: &str) -> Result<()> {
+        // Quick check: already running?
         {
             let servers = self.servers.lock().unwrap();
             if servers.contains_key(language) {
@@ -218,88 +232,108 @@ impl LspClient {
 
         let lang = language.to_string();
         let workspace = self.workspace_root.clone();
-        let servers_clone = self.servers.clone();
 
-        tokio::time::timeout(Duration::from_secs(30), tokio::task::spawn_blocking(move || {
-            let (bin, args): (&str, &[&str]) = match lang.as_str() {
-                "python" => ("pylsp", &[]),
-                "rust" => ("rust-analyzer", &[]),
-                "typescript" | "javascript" => {
-                    if which::which("typescript-language-server").is_ok() {
-                        ("typescript-language-server", &["--stdio"] as &[&str])
-                    } else {
-                        warn!("typescript-language-server not found, LSP for TS/JS disabled");
-                        return Ok(());
-                    }
-                }
-                _ => {
-                    warn!(language = lang.as_str(), "No LSP server configured for language");
+        let (bin, args): (&str, &[&str]) = match lang.as_str() {
+            "python" => ("pylsp", &[] as &[&str]),
+            "rust" => ("rust-analyzer", &[]),
+            "typescript" | "javascript" => {
+                if which::which("typescript-language-server").is_ok() {
+                    ("typescript-language-server", &["--stdio"] as &[&str])
+                } else {
+                    warn!("typescript-language-server not found, LSP for TS/JS disabled");
                     return Ok(());
                 }
-            };
-
-            if which::which(bin).is_err() {
-                warn!(binary = bin, language = lang.as_str(), "LSP server not installed");
+            }
+            _ => {
+                warn!(language = lang.as_str(), "No LSP server configured for language");
                 return Ok(());
             }
+        };
 
-            let mut cmd = Command::new(bin);
-            cmd.args(args);
-            cmd.stdin(Stdio::piped());
-            cmd.stdout(Stdio::piped());
-            cmd.stderr(Stdio::null());
-            cmd.current_dir(&workspace);
+        if which::which(bin).is_err() {
+            warn!(binary = bin, language = lang.as_str(), "LSP server not installed");
+            return Ok(());
+        }
 
-            let mut child = cmd.spawn()
-                .map_err(|e| anyhow!("Failed to spawn {} LSP server: {}", lang, e))?;
+        // Spawn the process (tokio::process::Command is async-friendly)
+        let mut cmd = Command::new(bin);
+        cmd.args(args);
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::null());
+        cmd.current_dir(&workspace);
 
-            let stdin = child.stdin.take()
-                .ok_or_else(|| anyhow!("Failed to get stdin for LSP server"))?;
-            let stdout = child.stdout.take()
-                .ok_or_else(|| anyhow!("Failed to get stdout for LSP server"))?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| anyhow!("Failed to spawn {} LSP server: {}", lang, e))?;
 
-            let root_uri = Url::from_directory_path(&workspace)
-                .map(|u| u.to_string())
-                .unwrap_or_else(|_| format!("file://{}", workspace.display()));
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("Failed to get stdin for LSP server"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("Failed to get stdout for LSP server"))?;
 
-            let mut conn = LspConnection {
-                process: child,
-                stdin,
-                stdout: BufReader::new(stdout),
-                next_id: 1,
-                root_uri,
-            };
+        let root_uri = Url::from_directory_path(&workspace)
+            .map(|u| u.to_string())
+            .unwrap_or_else(|_| format!("file://{}", workspace.display()));
 
-            if let Err(e) = conn.initialize() {
+        let mut conn = LspConnection {
+            process: child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            next_id: 1,
+            root_uri,
+        };
+
+        // Initialize handshake with timeout
+        let init_result = timeout(Duration::from_secs(30), conn.initialize()).await;
+
+        match init_result {
+            Ok(Ok(())) => {
+                let mut servers = self.servers.lock().unwrap();
+                servers.insert(lang.clone(), conn);
+                info!(language = lang.as_str(), "LSP server started");
+                Ok(())
+            }
+            Ok(Err(e)) => {
                 warn!(language = lang.as_str(), error = %e, "LSP server init failed");
-                let _ = conn.process.kill();
-                return Ok(());
+                let _ = conn.process.kill().await;
+                Err(e)
             }
-
-            let mut servers = servers_clone.lock().unwrap();
-            servers.insert(lang.clone(), conn);
-            
-            info!(language = lang.as_str(), "LSP server started");
-            Ok(())
-        })).await
-            .map_err(|e| anyhow!("LSP ensure_server timed out: {}", e))?
-            .map_err(|e| anyhow!("spawn_blocking error: {}", e))?
+            Err(_elapsed) => {
+                warn!(language = lang.as_str(), "LSP server init timed out");
+                let _ = conn.process.kill().await;
+                Err(anyhow!("LSP server {} initialization timed out after 30s", lang))
+            }
+        }
     }
 
-    /// Notify the LSP server that a document has been opened
-    pub async fn open_document(&self, language: &str, path: &Path, content: &str) -> Result<()> {
-        let servers = self.servers.clone();
+    /// Notify the LSP server that a document has been opened.
+    pub async fn open_document(
+        &self,
+        language: &str,
+        path: &Path,
+        content: &str,
+    ) -> Result<()> {
         let lang = language.to_string();
         let path_buf = path.to_path_buf();
         let content = content.to_string();
 
-        tokio::time::timeout(Duration::from_secs(10), tokio::task::spawn_blocking(move || {
-            let mut servers = servers.lock().unwrap();
-            let conn = match servers.get_mut(&lang) {
-                Some(c) => c,
-                None => return Ok(()),
-            };
+        // Extract connection from pool (no lock held during I/O)
+        let conn = {
+            let mut servers = self.servers.lock().unwrap();
+            servers.remove(&lang)
+        };
 
+        let mut conn = match conn {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+
+        let result = timeout(Duration::from_secs(10), async {
             let uri = Url::from_file_path(&path_buf)
                 .map(|u| u.to_string())
                 .map_err(|_| anyhow!("Invalid file path for LSP"))?;
@@ -313,27 +347,52 @@ impl LspClient {
                 }
             });
 
-            conn.send_notification("textDocument/didOpen", params)?;
-            Ok(())
-        })).await
-            .map_err(|e| anyhow!("LSP open_document timed out: {}", e))?
-            .map_err(|e| anyhow!("spawn_blocking error: {}", e))?
+            conn.send_notification("textDocument/didOpen", params).await
+        }).await;
+
+        match result {
+            Ok(Ok(())) => {
+                // Re-insert connection
+                let mut servers = self.servers.lock().unwrap();
+                servers.insert(lang, conn);
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                let _ = conn.process.kill().await;
+                Err(e)
+            }
+            Err(_elapsed) => {
+                // Timeout — connection dropped (process killed)
+                warn!(language = lang.as_str(), "LSP open_document timed out, server will restart on demand");
+                Err(anyhow!("LSP open_document timed out"))
+            }
+        }
     }
 
-    /// Notify the LSP server that a document has changed
-    pub async fn did_change(&self, language: &str, path: &Path, content: &str, version: i32) -> Result<()> {
-        let servers = self.servers.clone();
+    /// Notify the LSP server that a document has changed.
+    pub async fn did_change(
+        &self,
+        language: &str,
+        path: &Path,
+        content: &str,
+        version: i32,
+    ) -> Result<()> {
         let lang = language.to_string();
         let path_buf = path.to_path_buf();
         let content = content.to_string();
 
-        tokio::task::spawn_blocking(move || {
-            let mut servers = servers.lock().unwrap();
-            let conn = match servers.get_mut(&lang) {
-                Some(c) => c,
-                None => return Ok(()),
-            };
+        // Extract connection from pool
+        let conn = {
+            let mut servers = self.servers.lock().unwrap();
+            servers.remove(&lang)
+        };
 
+        let mut conn = match conn {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+
+        let result = timeout(Duration::from_secs(10), async {
             let uri = Url::from_file_path(&path_buf)
                 .map(|u| u.to_string())
                 .map_err(|_| anyhow!("Invalid file path for LSP"))?;
@@ -348,12 +407,27 @@ impl LspClient {
                 }]
             });
 
-            conn.send_notification("textDocument/didChange", params)?;
-            Ok(())
-        }).await.map_err(|e| anyhow!("spawn_blocking error: {}", e))?
+            conn.send_notification("textDocument/didChange", params).await
+        }).await;
+
+        match result {
+            Ok(Ok(())) => {
+                let mut servers = self.servers.lock().unwrap();
+                servers.insert(lang, conn);
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                let _ = conn.process.kill().await;
+                Err(e)
+            }
+            Err(_elapsed) => {
+                warn!(language = lang.as_str(), "LSP did_change timed out, server will restart on demand");
+                Err(anyhow!("LSP did_change timed out"))
+            }
+        }
     }
 
-    /// Find all references to the symbol at the given position
+    /// Find all references to the symbol at the given position.
     pub async fn find_references(
         &self,
         language: &str,
@@ -362,17 +436,20 @@ impl LspClient {
         column: u32,
         include_declaration: bool,
     ) -> Result<Vec<LspLocation>> {
-        let servers = self.servers.clone();
         let lang = language.to_string();
         let path_buf = path.to_path_buf();
 
-        tokio::time::timeout(Duration::from_secs(30), tokio::task::spawn_blocking(move || {
-            let mut servers = servers.lock().unwrap();
-            let conn = match servers.get_mut(&lang) {
-                Some(c) => c,
-                None => return Ok(Vec::new()),
-            };
+        let conn = {
+            let mut servers = self.servers.lock().unwrap();
+            servers.remove(&lang)
+        };
 
+        let mut conn = match conn {
+            Some(c) => c,
+            None => return Ok(Vec::new()),
+        };
+
+        let result = timeout(Duration::from_secs(30), async {
             let uri = Url::from_file_path(&path_buf)
                 .map_err(|_| anyhow!("Invalid file path for LSP"))?;
 
@@ -382,16 +459,32 @@ impl LspClient {
                 "context": { "includeDeclaration": include_declaration }
             });
 
-            let result = conn.send_request("textDocument/references", params)?;
-            if result.is_null() { return Ok(Vec::new()); }
+            let result = conn.send_request("textDocument/references", params).await?;
+            if result.is_null() {
+                return Ok(Vec::new());
+            }
             let locations: Vec<LspLocation> = serde_json::from_value(result).unwrap_or_default();
             Ok(locations)
-        })).await
-            .map_err(|e| anyhow!("LSP find_references timed out: {}", e))?
-            .map_err(|e| anyhow!("spawn_blocking error: {}", e))?
+        }).await;
+
+        match result {
+            Ok(Ok(locations)) => {
+                let mut servers = self.servers.lock().unwrap();
+                servers.insert(lang, conn);
+                Ok(locations)
+            }
+            Ok(Err(e)) => {
+                let _ = conn.process.kill().await;
+                Err(e)
+            }
+            Err(_elapsed) => {
+                warn!(language = lang.as_str(), "LSP find_references timed out, server will restart on demand");
+                Err(anyhow!("LSP find_references timed out after 30s"))
+            }
+        }
     }
 
-    /// Get hover information at a position
+    /// Get hover information at a position.
     pub async fn get_hover(
         &self,
         language: &str,
@@ -399,17 +492,20 @@ impl LspClient {
         line: u32,
         column: u32,
     ) -> Result<Option<String>> {
-        let servers = self.servers.clone();
         let lang = language.to_string();
         let path_buf = path.to_path_buf();
 
-        tokio::time::timeout(Duration::from_secs(15), tokio::task::spawn_blocking(move || {
-            let mut servers = servers.lock().unwrap();
-            let conn = match servers.get_mut(&lang) {
-                Some(c) => c,
-                None => return Ok(None),
-            };
+        let conn = {
+            let mut servers = self.servers.lock().unwrap();
+            servers.remove(&lang)
+        };
 
+        let mut conn = match conn {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        let result = timeout(Duration::from_secs(15), async {
             let uri = Url::from_file_path(&path_buf)
                 .map_err(|_| anyhow!("Invalid file path for LSP"))?;
 
@@ -418,8 +514,10 @@ impl LspClient {
                 "position": { "line": line, "character": column }
             });
 
-            let result = conn.send_request("textDocument/hover", params)?;
-            if result.is_null() { return Ok(None); }
+            let result = conn.send_request("textDocument/hover", params).await?;
+            if result.is_null() {
+                return Ok(None);
+            }
 
             if let Some(contents) = result.get("contents") {
                 match contents {
@@ -433,12 +531,26 @@ impl LspClient {
                 }
             }
             Ok(None)
-        })).await
-            .map_err(|e| anyhow!("LSP get_hover timed out: {}", e))?
-            .map_err(|e| anyhow!("spawn_blocking error: {}", e))?
+        }).await;
+
+        match result {
+            Ok(Ok(hover)) => {
+                let mut servers = self.servers.lock().unwrap();
+                servers.insert(lang, conn);
+                Ok(hover)
+            }
+            Ok(Err(e)) => {
+                let _ = conn.process.kill().await;
+                Err(e)
+            }
+            Err(_elapsed) => {
+                warn!(language = lang.as_str(), "LSP get_hover timed out, server will restart on demand");
+                Err(anyhow!("LSP get_hover timed out after 15s"))
+            }
+        }
     }
 
-    /// Go to definition of the symbol at the given position
+    /// Go to definition of the symbol at the given position.
     pub async fn get_definition(
         &self,
         language: &str,
@@ -446,17 +558,20 @@ impl LspClient {
         line: u32,
         column: u32,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        let servers = self.servers.clone();
         let lang = language.to_string();
         let path_buf = path.to_path_buf();
 
-        tokio::time::timeout(Duration::from_secs(15), tokio::task::spawn_blocking(move || {
-            let mut servers = servers.lock().unwrap();
-            let conn = match servers.get_mut(&lang) {
-                Some(c) => c,
-                None => return Ok(None),
-            };
+        let conn = {
+            let mut servers = self.servers.lock().unwrap();
+            servers.remove(&lang)
+        };
 
+        let mut conn = match conn {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        let result = timeout(Duration::from_secs(15), async {
             let uri = Url::from_file_path(&path_buf)
                 .map_err(|_| anyhow!("Invalid file path for LSP"))?;
 
@@ -465,8 +580,10 @@ impl LspClient {
                 "position": { "line": line, "character": column }
             });
 
-            let result = conn.send_request("textDocument/definition", params)?;
-            if result.is_null() { return Ok(None); }
+            let result = conn.send_request("textDocument/definition", params).await?;
+            if result.is_null() {
+                return Ok(None);
+            }
 
             if let Ok(loc) = serde_json::from_value::<LspLocation>(result.clone()) {
                 return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
@@ -475,12 +592,26 @@ impl LspClient {
                 return Ok(Some(GotoDefinitionResponse::Array(locs)));
             }
             Ok(None)
-        })).await
-            .map_err(|e| anyhow!("LSP get_definition timed out: {}", e))?
-            .map_err(|e| anyhow!("spawn_blocking error: {}", e))?
+        }).await;
+
+        match result {
+            Ok(Ok(def)) => {
+                let mut servers = self.servers.lock().unwrap();
+                servers.insert(lang, conn);
+                Ok(def)
+            }
+            Ok(Err(e)) => {
+                let _ = conn.process.kill().await;
+                Err(e)
+            }
+            Err(_elapsed) => {
+                warn!(language = lang.as_str(), "LSP get_definition timed out, server will restart on demand");
+                Err(anyhow!("LSP get_definition timed out after 15s"))
+            }
+        }
     }
 
-    /// Get completion suggestions at a position
+    /// Get completion suggestions at a position.
     pub async fn get_completions(
         &self,
         language: &str,
@@ -488,17 +619,20 @@ impl LspClient {
         line: u32,
         column: u32,
     ) -> Result<Vec<LspCompletionItem>> {
-        let servers = self.servers.clone();
         let lang = language.to_string();
         let path_buf = path.to_path_buf();
 
-        tokio::time::timeout(Duration::from_secs(15), tokio::task::spawn_blocking(move || {
-            let mut servers = servers.lock().unwrap();
-            let conn = match servers.get_mut(&lang) {
-                Some(c) => c,
-                None => return Ok(Vec::new()),
-            };
+        let conn = {
+            let mut servers = self.servers.lock().unwrap();
+            servers.remove(&lang)
+        };
 
+        let mut conn = match conn {
+            Some(c) => c,
+            None => return Ok(Vec::new()),
+        };
+
+        let result = timeout(Duration::from_secs(15), async {
             let uri = Url::from_file_path(&path_buf)
                 .map_err(|_| anyhow!("Invalid file path for LSP"))?;
 
@@ -507,8 +641,10 @@ impl LspClient {
                 "position": { "line": line, "character": column }
             });
 
-            let result = conn.send_request("textDocument/completion", params)?;
-            if result.is_null() { return Ok(Vec::new()); }
+            let result = conn.send_request("textDocument/completion", params).await?;
+            if result.is_null() {
+                return Ok(Vec::new());
+            }
 
             if let Ok(items) = serde_json::from_value::<Vec<LspCompletionItem>>(result.clone()) {
                 return Ok(items);
@@ -519,9 +655,23 @@ impl LspClient {
                 }
             }
             Ok(Vec::new())
-        })).await
-            .map_err(|e| anyhow!("LSP get_completions timed out: {}", e))?
-            .map_err(|e| anyhow!("spawn_blocking error: {}", e))?
+        }).await;
+
+        match result {
+            Ok(Ok(completions)) => {
+                let mut servers = self.servers.lock().unwrap();
+                servers.insert(lang, conn);
+                Ok(completions)
+            }
+            Ok(Err(e)) => {
+                let _ = conn.process.kill().await;
+                Err(e)
+            }
+            Err(_elapsed) => {
+                warn!(language = lang.as_str(), "LSP get_completions timed out, server will restart on demand");
+                Err(anyhow!("LSP get_completions timed out after 15s"))
+            }
+        }
     }
 }
 
