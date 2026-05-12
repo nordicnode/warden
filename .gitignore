@@ -1,3 +1,31 @@
-/target/
-**/*.rs.bk
-Cargo.lock
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Node dependencies
+node_modules/
+
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.tox/
+
+# Linter caches
+.mypy_cache/
+.ruff_cache/
+.ruff_cache/
+
+# Build / dist
+dist/
+build/
+*.egg-info/
+
+# OS
+.DS_Store

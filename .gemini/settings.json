@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "codeforge": {
+      "command": "/home/mikey/Desktop/mcp_server/.venv/bin/python3",
+      "args": [
+        "-m",
+        "codeforge_mcp.server"
+      ],
+      "env": {
+        "CODEFORGE_SANDBOX": "0"
+      }
+    }
+  }
+}
