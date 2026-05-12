@@ -14,11 +14,198 @@ Supports:
 from __future__ import annotations
 
 import asyncio
+import json
 import re
-from dataclasses import dataclass
+
+# Compiled once — used to identify test files without false positives like
+# contest.py, authentication.py, latest_results.py, fastest.py, etc.
+_TEST_FILE_RE = re.compile(r"(?:^|[/._-])(?:test_(?!helpers)|tests?/|__tests?__/|\bspec[./]|\btest[./])", re.IGNORECASE)
+
+# ── Role-to-Capability Mapping ──────────────────────────────────────────────
+# Roles are aliases for capability pipelines. Each capability maps to a
+# specific hardcoded handler that returns facts.
+# _CAP_HANDLERS_KEYS mirrors the keys of cap_handlers inside spawn_subagent.
+# This guarantees available_capabilities always matches the executor.
+_CAP_HANDLERS_KEYS: list[str] = [
+    "search", "ast", "symbol", "lsp", "graph", "graph_upstream", "diagnose",
+]
+_ROLE_CAPS: dict[str, list[str]] = {
+    "file_finder": ["search"],
+    "code_searcher": ["search", "ast", "symbol"],
+    "reviewer": ["lsp", "graph"],
+    "test_impact": ["graph_upstream"],
+    "diagnose": ["diagnose"],
+    "refactor_advisor": ["graph", "ast"],
+    "security_auditor": ["ast", "search"],
+    "doc_generator": ["ast", "lsp"],
+}
+
+from dataclasses import dataclass, field
+from typing import Literal
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 
+
+# ── Constants ────────────────────────────────────────────────────────────────
+# Minimum budget per agent in spawn_multiple. Below this, no capability
+# pipeline can run (each capability needs ~500 tokens at minimum).
+MIN_AGENT_BUDGET = 500
+
+
+# ── Token Estimation ─────────────────────────────────────────────────────────
+
+_encoder: "tiktoken.Encoding" | None = None
+
+
+def _get_encoder() -> "tiktoken.Encoding | None":
+    """Lazily create and cache a tiktoken encoder for gpt-4o."""
+    global _encoder
+    if _encoder is None:
+        try:
+            import tiktoken
+            _encoder = tiktoken.encoding_for_model("gpt-4o")
+        except (ImportError, OSError):
+            return None
+    return _encoder
+
+
+def _estimate_tokens(data: Any) -> int:
+    """Estimate token count for a data payload using tiktoken.
+
+    Falls back to a byte-length heuristic (len(str(data)) // 4) if tiktoken
+    is unavailable. The tiktoken approach is more accurate for structured data
+    as it counts actual GPT token boundaries rather than assuming 4 bytes/token.
+    """
+    enc = _get_encoder()
+    if enc is not None:
+        text = json.dumps(data) if not isinstance(data, str) else data
+        return len(enc.encode(text))
+    # Fallback: tiktoken unavailable or encoding not found
+    return len(str(data)) // 4
+
+
+# ── Capability Registry ─────────────────────────────────────────────────────
+# Each capability declares what blackboard keys it produces (writes) and
+# consumes (reads). The orchestrator topologically sorts capabilities by
+# their produces→consumes edges before executing a pipeline.
+
+@dataclass
+class Capability:
+    name: str
+    handler: Callable[..., Awaitable[SubAgentResult]]
+    produces: set[str] = field(default_factory=set)   # blackboard keys written
+    consumes: set[str] = field(default_factory=set)   # blackboard keys read (optional)
+    retry_strategy: Literal["none", "broaden", "fallback"] = "none"
+    max_retries: int = 1
+
+
+def _topo_sort(capabilities: list[Capability]) -> list[Capability]:
+    """Topologically sort capabilities by produces→consumes edges.
+
+    Raises:
+        ValueError: If a cycle is detected or a consumer has no producer.
+    """
+    name_to_cap: dict[str, Capability] = {c.name: c for c in capabilities}
+    produced_keys: set[str] = set()
+    for cap in capabilities:
+        produced_keys.update(cap.produces)
+
+    # Check for missing producers first
+    for cap in capabilities:
+        for key in cap.consumes:
+            if key not in produced_keys:
+                raise ValueError(
+                    f"Capability '{cap.name}' consumes '{key}' but no capability "
+                    f"produces it. Available producers: {sorted(produced_keys)}"
+                )
+
+    # Kahn's algorithm: build graph where edge A→B means A must execute before B
+    # (B consumes something A produces)
+    graph: dict[str, list[str]] = {c.name: [] for c in capabilities}
+    in_deg: dict[str, int] = {c.name: 0 for c in capabilities}
+
+    for i, cap_a in enumerate(capabilities):
+        for j, cap_b in enumerate(capabilities):
+            if i == j:
+                continue
+            # If cap_b consumes something cap_a produces, cap_a must come first
+            if any(k in cap_b.consumes for k in cap_a.produces):
+                graph[cap_a.name].append(cap_b.name)
+                in_deg[cap_b.name] += 1
+
+    # Kahn's algorithm
+    queue: list[str] = [n for n, d in in_deg.items() if d == 0]
+    sorted_names: list[str] = []
+    while queue:
+        node = queue.pop(0)
+        sorted_names.append(node)
+        for neighbor in graph[node]:
+            in_deg[neighbor] -= 1
+            if in_deg[neighbor] == 0:
+                queue.append(neighbor)
+
+    if len(sorted_names) != len(capabilities):
+        # Cycle detected — find the cycle for a helpful error message
+        remaining = [n for n in in_deg if in_deg[n] > 0]
+        raise ValueError(
+            f"Cycle detected in capability dependencies involving: {remaining}. "
+            f"Capabilities with remaining in-degree after topological sort: {remaining}"
+        )
+
+    # Map back to Capability objects preserving original order for ties
+    name_to_cap = {c.name: c for c in capabilities}
+    return [name_to_cap[n] for n in sorted_names]
+
+
+# Module-level capability registry — replace cap_handlers
+# Each capability documents what blackboard keys it produces/consumes
+_CAPABILITY_REGISTRY: dict[str, Capability] = {}
+
+def _broaden_task(task: str) -> str:
+    """Strip quotes and widen to substring/regex to increase recall on retry.
+
+    Applied when a handler returns empty results or fails.
+    """
+    # Remove surrounding quotes (both " and ')
+    broadened = re.sub(r'^[\"\'](.+)[\"\']\s*$', r'\1', task.strip())
+    if broadened == task:  # No outer quotes stripped, remove internal quotes
+        broadened = task.replace('"', '').replace("'", '')
+    # Add wildcard suffix if no glob pattern present
+    if not any(c in broadened for c in '*?['):
+        words = broadened.split()
+        if words:
+            broadened = broadened + ' *'
+    return broadened
+
+
+def _fallback_task(task: str) -> str:
+    """Switch to keyword/substring search when exact/regex search fails.
+
+    Takes the last significant identifier word and searches as a substring,
+    dropping path/regex context.
+    """
+    keywords = {w for w in re.findall(r'\b[A-Za-z_][A-Za-z0-9_]*\b', task)
+                if w.lower() not in {
+                    'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'of', 'with',
+                    'and', 'or', 'is', 'are', 'was', 'were', 'find', 'search',
+                    'look', 'where', 'how', 'what', 'which', 'file', 'function',
+                    'class',
+                }}
+    fallback_word = list(keywords)[-1] if keywords else task
+    return fallback_word
+
+
+def _register_capability(name: str, handler: Callable[..., Awaitable[SubAgentResult]],
+                         produces: set[str], consumes: set[str] | None = None) -> None:
+    _CAPABILITY_REGISTRY[name] = Capability(
+        name=name,
+        handler=handler,
+        produces=produces,
+        consumes=consumes or set(),
+    )
+
+
+# ── Result Types ─────────────────────────────────────────────────────────────
 
 @dataclass
 class SubAgentResult:
@@ -160,6 +347,10 @@ class SubAgentOrchestrator:
         self.lsp = lsp_multiplexer
         self.project_root = project_root
         self.budget = context_budget or ContextBudget()
+        # Register all capabilities (unbound methods) at module load time.
+        # Called once per orchestrator instance to keep _CAPABILITY_REGISTRY populated
+        # and _CAP_HANDLERS_KEYS in sync with the executor.
+        _register_all_capabilities()
 
     def _normalize_file_path(self, path: str | Path) -> str:
         """Return a stable, project-relative path when possible."""
@@ -444,19 +635,9 @@ class SubAgentOrchestrator:
         
         bb = blackboard or Blackboard()
 
-        # ── Role-to-Capability Mapping ──────────────────────────────────
-        # Roles are now aliases for capability pipelines. Each capability
-        # maps to a specific hardcoded handler that returns facts.
-        ROLE_CAPS: dict[str, list[str]] = {
-            "file_finder": ["search"],
-            "code_searcher": ["search", "ast", "symbol"],
-            "reviewer": ["lsp", "graph"],
-            "test_impact": ["graph_upstream"],
-            "diagnose": ["diagnose"],
-            "refactor_advisor": ["graph", "ast"],
-            "security_auditor": ["ast", "search"],
-            "doc_generator": ["ast", "lsp"],
-        }
+        # Use module-level _ROLE_CAPS (defined at top of file) to guarantee
+        # the planning prompt always matches the actual executor capabilities.
+        ROLE_CAPS = _ROLE_CAPS
         # Common aliases — promote intuitive role names to the canonical set.
         ROLE_ALIASES: dict[str, str] = {
             "researcher": "code_searcher",
@@ -506,64 +687,93 @@ class SubAgentOrchestrator:
         total_tokens = 0
         errors = []
 
-        # Available primitive handlers (hardcoded fact-returning logic)
-        cap_handlers: dict[str, Callable[..., Awaitable[SubAgentResult]]] = {
-            "search": self._run_file_finder,
-            "ast": self._run_code_searcher,
-            "symbol": self._run_symbol_searcher,
-            "lsp": self._run_reviewer, # aliased for now
-            "graph": self._run_reviewer, # aliased for now
-            "graph_upstream": self._run_test_impact,
-            "diagnose": self._run_diagnose,
-        }
-
-        # Deduplicate capabilities that resolve to the same handler, preserving order.
-        # This prevents _run_reviewer from being called twice when capabilities
-        # ["lsp", "graph"] are both present (both map to the same handler).
-        # Use handler.__name__ instead of id(handler) — Python bound-method
-        # ids are not stable across accesses (CPython creates a new bound
-        # method object each time handler is retrieved from the dict).
+        # Resolve capabilities to Capability objects from the registry.
+        # Deduplicate by capability name, preserving order.
         seen_caps: set[str] = set()
-        seen_handlers: set[str] = set()
-        unique_caps: list[str] = []
+        unique_caps: list[Capability] = []
         for c in capabilities:
-            handler = cap_handlers.get(c)
-            if handler is None:
+            if c in seen_caps or c not in _CAPABILITY_REGISTRY:
                 continue
-            handler_key = handler.__name__
-            if c not in seen_caps and handler_key not in seen_handlers:
-                seen_caps.add(c)
-                seen_handlers.add(handler_key)
-                unique_caps.append(c)
+            seen_caps.add(c)
+            unique_caps.append(_CAPABILITY_REGISTRY[c])
 
-        for cap in unique_caps:
+        # Topologically sort capabilities by produces→consumes edges so that
+        # producers always execute before consumers that depend on their output.
+        try:
+            sorted_caps = _topo_sort(unique_caps)
+        except ValueError as e:
+            return SubAgentResult(
+                role=role or "dynamic", task=task, success=False,
+                error=f"Capability dependency error: {e}",
+            )
+
+        for cap in sorted_caps:
             # Check budget before each capability to prevent runaway usage
             if budget.would_exceed(500): # Conservative estimate per capability
                  errors.append(f"{cap}: Budget exceeded")
                  continue
 
-            handler = cap_handlers.get(cap)
-            if handler is None:
-                errors.append(f"Unknown capability: {cap}")
-                continue
-            
-            try:
-                # Handlers update the blackboard and return a result object
-                res = await handler(task, files, blackboard=bb)
-                total_tokens += res.token_estimate
-                if res.success:
-                    any_success = True
-                    # Merge result data: append to lists, overwrite other types
-                    if isinstance(res.data, dict):
-                        for k, v in res.data.items():
-                            if k in results_data and isinstance(v, list) and isinstance(results_data[k], list):
-                                results_data[k].extend(v)
-                            else:
-                                results_data[k] = v
-                else:
-                    errors.append(f"{cap}: {res.error}")
-            except Exception as e:
-                errors.append(f"{cap}: {str(e)}")
+            # Bind unbound method to this orchestrator instance
+            handler = cap.handler.__get__(self, SubAgentOrchestrator)
+            retry_count = 0
+            last_error = ""
+            last_result: SubAgentResult | None = None
+            current_task = task
+
+            while retry_count <= cap.max_retries:
+                try:
+                    res = await handler(current_task, files, blackboard=bb)
+                    total_tokens += res.token_estimate
+                    # ── Retry on empty data (orchestrator-level fallback) ──
+                    # Trigger retry when handler succeeded but returned nothing useful.
+                    # Skip entirely if strategy is "none".
+                    if res.success and cap.retry_strategy != "none" and retry_count < cap.max_retries and not budget.would_exceed(300):
+                        has_data = False
+                        if isinstance(res.data, dict):
+                            for v in res.data.values():
+                                if v and v != 0 and v != "":
+                                    has_data = True
+                                    break
+                        elif res.data:
+                            has_data = True
+                        if not has_data:
+                            retry_count += 1
+                            if cap.retry_strategy == "broaden":
+                                current_task = _broaden_task(current_task)
+                            elif cap.retry_strategy == "fallback":
+                                current_task = _fallback_task(current_task)
+                            continue  # retry with modified task
+
+                    if res.success:
+                        any_success = True
+                        if isinstance(res.data, dict):
+                            for k, v in res.data.items():
+                                if k in results_data and isinstance(v, list) and isinstance(results_data[k], list):
+                                    results_data[k].extend(v)
+                                else:
+                                    results_data[k] = v
+                        break  # success — exit retry loop
+                    else:
+                        last_error = res.error
+                        last_result = res
+                except Exception as e:
+                    last_error = str(e)
+                    last_result = None
+
+                # Decide whether to retry on exception
+                if cap.retry_strategy != "none" and retry_count < cap.max_retries and not budget.would_exceed(300):
+                    retry_count += 1
+                    if cap.retry_strategy == "broaden":
+                        current_task = _broaden_task(current_task)
+                    elif cap.retry_strategy == "fallback":
+                        current_task = _fallback_task(current_task)
+                    continue  # retry with modified task
+
+                # No more retries — record and break
+                break
+
+            if not any_success and last_error:
+                errors.append(f"{cap}: {last_error}")
 
         # Track cumulative budget usage across all subagent calls.
         # When a budget_override is supplied we consume against THAT budget
@@ -614,11 +824,24 @@ class SubAgentOrchestrator:
         # race on self.budget.
         n_agents = len(specs)
         remaining = self.budget.remaining
-        base = max(2000, remaining // max(n_agents, 1))
-        if base * n_agents > remaining:
-            per_agent_budget = remaining // max(n_agents, 1)
-        else:
-            per_agent_budget = base
+        per_agent_budget = remaining // max(n_agents, 1)
+
+        if per_agent_budget < MIN_AGENT_BUDGET:
+            # Not enough budget for parallel execution — all agents would fail
+            # their capability pipeline check (needs ≥ 500 tokens per capability).
+            return [
+                SubAgentResult(
+                    role=spec.get("role", "unknown"),
+                    task=spec.get("task", ""),
+                    success=False,
+                    error=(
+                        f"Insufficient budget for parallel execution "
+                        f"(need ≥ {MIN_AGENT_BUDGET} tokens/agent, have {per_agent_budget}). "
+                        f"Total remaining: {remaining}, agents: {n_agents}."
+                    ),
+                )
+                for spec in specs
+            ]
 
         tasks = []
         for spec in specs:
@@ -690,39 +913,44 @@ class SubAgentOrchestrator:
 
         Instead of hardcoded regex, this returns a schema that the client LLM
         can use to formulate its own plan using spawn_subagents.
+
+        The Preset Roles and available_capabilities are generated from live
+        module constants (_ROLE_CAPS and cap_handlers keys) to guarantee the
+        planning prompt always matches the actual executor.
         """
+        # Build Preset Roles section by iterating _ROLE_CAPS
+        roles_lines = "\n".join(
+            f"- {role}: {caps}"
+            for role, caps in _ROLE_CAPS.items()
+        )
+        cap_desc_lines = "\n".join(
+            f"- {cap}"
+            for cap in _CAP_HANDLERS_KEYS
+        )
+
         planning_prompt = f"""
 You are a planning agent. Decompose the following task into a series of subagent calls.
 Task: {task}
 Available Files: {files}
 
 Capabilities:
-- search: Find files and search code for patterns.
-- ast: Extract symbol definitions and structure from files.
-- symbol: Look up specific symbol definitions (cross-file).
-- lsp: Run diagnostics and impact analysis.
-- graph: Analyze dependencies and call graphs.
-- graph_upstream: Identify test impact and upstream callers.
+{cap_desc_lines}
 
 Preset Roles (Aliased to Capabilities):
-- file_finder: ['search']
-- code_searcher: ['ast', 'symbol']
-- reviewer: ['lsp', 'graph']
-- test_impact: ['graph_upstream']
-- diagnose: ['search', 'lsp', 'graph']
+{roles_lines}
 
 Return a list of JSON objects for 'spawn_subagents', each containing:
 {{ "role": "...", "task": "...", "files": [...], "capabilities": [...] }}
 """
         data = {
             "planning_prompt": planning_prompt,
-            "available_capabilities": ["search", "ast", "symbol", "lsp", "graph", "graph_upstream"],
-            "suggested_roles": ["file_finder", "code_searcher", "reviewer", "test_impact", "diagnose"]
+            "available_capabilities": _CAP_HANDLERS_KEYS,
+            "suggested_roles": list(_ROLE_CAPS.keys())
         }
 
         return SubAgentResult(
             role="decompose", task=task, success=True,
-            data=data, token_estimate=len(planning_prompt) // 4,
+            data=data, token_estimate=_estimate_tokens(planning_prompt),
         )
 
     def _merge_results(self, results: list[SubAgentResult], blackboard: Blackboard) -> dict[str, Any]:
@@ -868,45 +1096,6 @@ Return a list of JSON objects for 'spawn_subagents', each containing:
                 search = code_search(self.project_root, term, context=2)
                 results["search_results"].extend(search)
 
-        # Feedback loop: if no results, try broader terms (substrings)
-        # Skip this fallback when explicit files were provided — the caller
-        # is being specific about scope; codebase-wide fallback defeats that.
-        if not has_explicit_files and not results["found_files"] and not results["search_results"]:
-            await blackboard.add_insight(f"Search for '{terms}' yielded no results. Retrying with broader substring match.")
-            for term in terms[:3]:
-                 # Substring search fallback
-                 search = code_search(self.project_root, term, context=1, regex=True)
-                 results["search_results"].extend(search)
-
-        # Symbol-aware fallback: if text search still fails, resolve the
-        # likely identifier and surface its defining file directly.
-        # Skip when explicit files were provided (same reasoning as above).
-        if not has_explicit_files and not results["found_files"] and not results["search_results"]:
-            for term in raw_terms[:3]:
-                try:
-                    symbol_result = await self._symbol_lookup_async(term)
-                except Exception:
-                    symbol_result = None
-                if not symbol_result:
-                    continue
-                sym_file = str(symbol_result.get("file", ""))
-                if sym_file:
-                    results["found_files"].append({
-                        "path": sym_file,
-                        "size": 0,
-                        "language": _language_from_ext(Path(sym_file).suffix),
-                    })
-                    results["search_results"].append({
-                        "file": sym_file,
-                        "line": symbol_result.get("line", 0),
-                        "text": f"symbol lookup: {symbol_result.get('name', term)}",
-                        "is_match": True,
-                        "score": 10,
-                    })
-                await blackboard.add_symbols([symbol_result.get("name", term)])
-                await blackboard.add_insight(
-                    f"Resolved '{term}' via symbol lookup after text search returned no matches."
-                )
 
         # Defensive filter: drop binary / cache artefacts that may have
         # slipped past the search tools (Phase 2 fix — keeps the blackboard
@@ -955,7 +1144,7 @@ Return a list of JSON objects for 'spawn_subagents', each containing:
 
         return SubAgentResult(
             role="file_finder", task=task, success=True,
-            data=results, token_estimate=len(str(results)) // 4,
+            data=results, token_estimate=_estimate_tokens(results),
         )
 
     async def _run_code_searcher(self, task: str, files: list[str], blackboard: Blackboard) -> SubAgentResult:
@@ -965,7 +1154,7 @@ Return a list of JSON objects for 'spawn_subagents', each containing:
         # (previously limited to 3, which was too restrictive for "find all
         # usages" tasks)
         target_files = files or list(blackboard.files)[:20]
-        if not target_files and blackboard.facts.get("coordination_mode") == "swarm":
+        if not target_files:
             await blackboard.wait_for("files_seeded")
             target_files = files or list(blackboard.files)[:20]
         ast_results: list[dict[str, Any]] = []
@@ -994,7 +1183,7 @@ Return a list of JSON objects for 'spawn_subagents', each containing:
         data = {"ast_results": ast_results[:50], "exact_definitions": exact_definitions[:10]}
         return SubAgentResult(
             role="code_searcher", task=task, success=True,
-            data=data, token_estimate=len(str(data)) // 4,
+            data=data, token_estimate=_estimate_tokens(data),
         )
 
     async def _run_symbol_searcher(self, task: str, files: list[str], blackboard: Blackboard) -> SubAgentResult:
@@ -1035,12 +1224,242 @@ Return a list of JSON objects for 'spawn_subagents', each containing:
         }
         return SubAgentResult(
             role="symbol_searcher", task=task, success=True,
-            data=data, token_estimate=len(str(data)) // 4,
+            data=data, token_estimate=_estimate_tokens(data),
         )
 
     async def _symbol_lookup_async(self, name: str) -> dict[str, Any] | None:
         from codeforge_mcp.tools.navigation import symbol_lookup
         return await symbol_lookup(self.lsp, self.graph, name)
+
+    def _gather_source_files(self, limit: int = 20) -> list[str]:
+        """Auto-gather up to `limit` source files from the project.
+
+        Used when no explicit files are provided to a reviewer handler.
+        """
+        from codeforge_mcp.indexer import discover_files
+        from codeforge_mcp.tools.navigation import _in_skipped_dir
+        all_files = discover_files(self.project_root)
+        seen: set[str] = set()
+        gathered: list[str] = []
+        for f in all_files:
+            if f not in seen and not _in_skipped_dir(Path(f)):
+                seen.add(f)
+                gathered.append(f)
+                if len(gathered) >= limit:
+                    break
+        return gathered
+
+    async def _run_lsp_review(self, task: str, files: list[str], blackboard: Blackboard) -> SubAgentResult:
+        """Run only LSP diagnostics on target files (no impact_analysis).
+
+        Handles the "lsp" capability: collects publishDiagnostics for each
+        target file and surfaces them as findings/checklist items.
+        """
+        diagnostics_results: list[dict[str, Any]] = []
+        findings: list[dict[str, Any]] = []
+        blocking_issues: list[dict[str, Any]] = []
+        lsp_degraded = False
+        review_context = blackboard.facts.get("review_context", {}) if blackboard else {}
+
+        target_files = files or list(blackboard.files)
+        if not target_files:
+            target_files = self._gather_source_files(limit=20)
+            if not target_files:
+                return SubAgentResult(
+                    role="reviewer", task=task, success=False,
+                    data={"diagnostics": [], "checklist": ["⚠ No source files found in the project."]},
+                    error="No target files available for review", token_estimate=50,
+                )
+
+        file_summaries: list[dict[str, Any]] = []
+        for f in target_files:
+            abs_path = str((Path(self.project_root).resolve() / f).resolve())
+            if self.lsp is not None:
+                try:
+                    diags = await self.lsp.diagnostics(abs_path)
+                    diagnostics_results.extend([{**d, "file": f} for d in diags])
+                except Exception as e:
+                    diags: list[dict[str, Any]] = []
+                    if not lsp_degraded:
+                        await blackboard.add_insight(
+                            "LSP unavailable — review degraded to graph-only mode."
+                        )
+                        lsp_degraded = True
+            else:
+                diags: list[dict[str, Any]] = []
+                if not lsp_degraded:
+                    await blackboard.add_insight(
+                        "LSP unavailable — review degraded to graph-only mode."
+                    )
+                    lsp_degraded = True
+            file_summaries.append({"file": f, "diagnostics": len(diags)})
+
+        checklist: list[str] = []
+        if diagnostics_results:
+            checklist.append(f"⚠ Found {len(diagnostics_results)} diagnostic issues")
+            for diag in diagnostics_results:
+                severity = diag.get("severity", 0)
+                severity_label = "error" if severity == 1 else "warning"
+                line = diag.get("line")
+                if line is None:
+                    line = (diag.get("range", {}).get("start", {}).get("line", 0) or 0) + 1
+                findings.append({
+                    "severity": severity_label,
+                    "code": "lsp_diagnostic",
+                    "file": diag.get("file", ""),
+                    "line": line,
+                    "message": diag.get("message", ""),
+                })
+                if severity == 1:
+                    blocking_issues.append(findings[-1])
+
+        changed_ranges = review_context.get("changed_ranges", [])
+        for changed in changed_ranges[:5]:
+            suspicious = self._inspect_changed_range(
+                changed.get("file", ""),
+                int(changed.get("start_line", 0) or 0),
+                int(changed.get("end_line", 0) or 0),
+            )
+            findings.extend(suspicious)
+            for finding in suspicious:
+                if finding["severity"] == "error":
+                    blocking_issues.append(finding)
+                    checklist.append(
+                        f"🔴 Suspicious edit artifact in {finding['file']}:{finding['line']} - {finding['message']}"
+                    )
+
+        if checklist:
+            for item in checklist:
+                await blackboard.add_insight(item)
+        else:
+            checklist.append(f"✅ {len(target_files)} files reviewed, 0 diagnostic issues.")
+
+        data = {
+            "diagnostics": diagnostics_results[:20],
+            "checklist": checklist,
+            "file_summaries": file_summaries,
+            "review_context": review_context,
+            "findings": findings[:25],
+            "blocking_issues": blocking_issues[:20],
+            "review_passed": len(blocking_issues) == 0,
+        }
+        data = self._trim_result_data(data)
+        return SubAgentResult(
+            role="reviewer", task=task, success=True,
+            data=data, token_estimate=_estimate_tokens(data),
+        )
+
+    async def _run_graph_review(self, task: str, files: list[str], blackboard: Blackboard) -> SubAgentResult:
+        """Run only graph-based impact_analysis on symbols in target files (no LSP calls).
+
+        Handles the "graph" capability: resolves symbols via the knowledge graph
+        and computes blast-radius (upstream callers, affected modules, tests).
+        """
+        from codeforge_mcp.tools.understanding import impact_analysis
+
+        impact_results: list[dict[str, Any]] = []
+        findings: list[dict[str, Any]] = []
+        blocking_issues: list[dict[str, Any]] = []
+        review_context = blackboard.facts.get("review_context", {}) if blackboard else {}
+
+        target_files = files or list(blackboard.files)
+        if not target_files:
+            target_files = self._gather_source_files(limit=20)
+            if not target_files:
+                return SubAgentResult(
+                    role="reviewer", task=task, success=False,
+                    data={"impact": [], "checklist": ["⚠ No source files found in the project."]},
+                    error="No target files available for review", token_estimate=50,
+                )
+
+        file_summaries: list[dict[str, Any]] = []
+        for f in target_files:
+            abs_path = str((Path(self.project_root).resolve() / f).resolve())
+            syms = self.graph.symbols_in_file(abs_path)
+            if not syms:
+                syms = self.graph.symbols_in_file(f)
+
+            # Limit to top 5 definition-kind symbols per file
+            defin_kinds = {"class", "function", "method", "struct", "interface", "constructor"}
+            ranked_syms = sorted(
+                syms,
+                key=lambda s: (0 if str(s.get("kind", "")).lower() in defin_kinds else 1,
+                              -int(s.get("line", 0))),
+            )
+            file_impact: list[dict[str, Any]] = []
+            for sym in ranked_syms[:5]:
+                impact = impact_analysis(
+                    self.graph, self.ast_indexer, sym["name"], sym["file"]
+                )
+                imp_summary = {
+                    "risk": impact.get("risk", "LOW"),
+                    "module_count": impact.get("module_count", 0),
+                    "callers": impact.get("callers", 0),
+                    "tests": len(impact.get("tests", [])),
+                }
+                if impact.get("note"):
+                    imp_summary["note"] = impact["note"]
+                impact_results.append({"symbol": sym["name"], "impact": imp_summary})
+                file_impact.append(imp_summary)
+
+            file_summaries.append({"file": f, "symbols": len(syms), "impact_summary": file_impact})
+
+        checklist: list[str] = []
+        for r in impact_results[:15]:
+            imp = r["impact"]
+            risk_label = imp.get("risk", "LOW")
+            if risk_label == "HIGH":
+                checklist.append(f"🔴 HIGH risk: {r['symbol']} affects {imp.get('module_count', 0)} modules")
+                blocking_issues.append({
+                    "severity": "error", "code": "high_risk_symbol",
+                    "file": "", "line": 0,
+                    "message": f"HIGH risk: {r['symbol']} affects {imp.get('module_count', 0)} modules",
+                })
+            elif risk_label == "MED":
+                checklist.append(f"🟡 MED risk: {r['symbol']} has {imp.get('callers', 0)} callers")
+
+        changed_ranges = review_context.get("changed_ranges", [])
+        for changed in changed_ranges[:5]:
+            suspicious = self._inspect_changed_range(
+                changed.get("file", ""),
+                int(changed.get("start_line", 0) or 0),
+                int(changed.get("end_line", 0) or 0),
+            )
+            findings.extend(suspicious)
+            for finding in suspicious:
+                if finding["severity"] == "error":
+                    blocking_issues.append(finding)
+                    checklist.append(
+                        f"🔴 Suspicious edit artifact in {finding['file']}:{finding['line']} - {finding['message']}"
+                    )
+
+        if checklist:
+            for item in checklist:
+                await blackboard.add_insight(item)
+        else:
+            total_symbols = sum(fs["symbols"] for fs in file_summaries)
+            checklist.append(
+                f"✅ {len(target_files)} files reviewed, "
+                f"{total_symbols} symbols analyzed, "
+                f"0 high-risk symbols detected."
+            )
+            for fs in file_summaries:
+                checklist.append(f"  • {fs['file']}: {fs['symbols']} symbols")
+
+        data = {
+            "impact": impact_results[:10],
+            "checklist": checklist,
+            "file_summaries": file_summaries,
+            "review_context": review_context,
+            "findings": findings[:25],
+            "blocking_issues": blocking_issues[:20],
+            "review_passed": len(blocking_issues) == 0,
+        }
+        data = self._trim_result_data(data)
+        return SubAgentResult(
+            role="reviewer", task=task, success=True,
+            data=data, token_estimate=_estimate_tokens(data),
+        )
 
     async def _run_reviewer(self, task: str, files: list[str], blackboard: Blackboard) -> SubAgentResult:
         from codeforge_mcp.tools.understanding import impact_analysis
@@ -1051,7 +1470,7 @@ Return a list of JSON objects for 'spawn_subagents', each containing:
         blocking_issues: list[dict[str, Any]] = []
         review_context = blackboard.facts.get("review_context", {}) if blackboard else {}
 
-        if not files and not blackboard.files and blackboard.facts.get("coordination_mode") == "swarm":
+        if not files and not blackboard.files:
             await blackboard.wait_for("files_seeded")
 
         # Combine provided files with blackboard files
@@ -1099,8 +1518,21 @@ Return a list of JSON objects for 'spawn_subagents', each containing:
             # Handle both relative and absolute paths for the graph
             abs_path = str((Path(self.project_root).resolve() / f).resolve())
             
-            diags = await self.lsp.diagnostics(abs_path)
-            diagnostics_results.extend([{**d, "file": f} for d in diags])
+            if self.lsp is not None:
+                try:
+                    diags = await self.lsp.diagnostics(abs_path)
+                    diagnostics_results.extend([{**d, "file": f} for d in diags])
+                except Exception:
+                    # LSP unavailable or error — continue with graph-only review
+                    diags: list[dict[str, Any]] = []
+                    await blackboard.add_insight(
+                        "LSP unavailable — review degraded to graph-only mode."
+                    )
+            else:
+                diags: list[dict[str, Any]] = []
+                await blackboard.add_insight(
+                    "LSP unavailable — review degraded to graph-only mode."
+                )
 
             # Try absolute then relative
             syms = self.graph.symbols_in_file(abs_path)
@@ -1214,7 +1646,7 @@ Return a list of JSON objects for 'spawn_subagents', each containing:
         data = self._trim_result_data(data)
         return SubAgentResult(
             role="reviewer", task=task, success=True,
-            data=data, token_estimate=len(str(data)) // 4,
+            data=data, token_estimate=_estimate_tokens(data),
         )
 
     def _inspect_changed_range(self, file_path: str, start_line: int, end_line: int) -> list[dict[str, Any]]:
@@ -1250,7 +1682,7 @@ Return a list of JSON objects for 'spawn_subagents', each containing:
 
         # Extract candidate symbol names from the task or blackboard
         candidates: list[str] = list(blackboard.symbols)
-        if not candidates and blackboard.facts.get("coordination_mode") == "swarm":
+        if not candidates:
             await blackboard.wait_for("symbols_seeded")
             candidates = list(blackboard.symbols)
         for word in task.split():
@@ -1292,7 +1724,13 @@ Return a list of JSON objects for 'spawn_subagents', each containing:
             all_callers.append(caller)
             name = caller.get("name", "")
             fname = caller.get("file", "")
-            if "test" in name.lower() or "test" in fname.lower() or "spec" in fname.lower():
+            name_lower = name.lower()
+            fname_lower = fname.lower()
+            if (
+                name.startswith("test_") or name.endswith("_test") or
+                _TEST_FILE_RE.search(fname) or
+                _TEST_FILE_RE.search(name_lower)
+            ):
                 tests_found.append({"name": name, "file": fname, "line": caller.get("line", 0)})
 
         if tests_found:
@@ -1303,7 +1741,7 @@ Return a list of JSON objects for 'spawn_subagents', each containing:
         return SubAgentResult(
             role="test_impact", task=task, success=True,
             data={"tests_found": tests_found, "total_callers": len(all_callers), "call_graph": cg},
-            token_estimate=len(str(all_callers)) // 4,
+            token_estimate=_estimate_tokens(all_callers),
         )
 
     async def _run_diagnose(self, task: str, files: list[str], blackboard: Blackboard) -> SubAgentResult:
@@ -1358,34 +1796,174 @@ Return a list of JSON objects for 'spawn_subagents', each containing:
 
         # Run LSP diagnostics on affected files
         target_files = sorted(list(set(files) | blackboard.files))
-        if not target_files and blackboard.facts.get("coordination_mode") == "swarm":
+        if not target_files:
             await blackboard.wait_for("files_seeded")
             target_files = sorted(list(set(files) | blackboard.files))
+        lsp_degraded = False
         for f in target_files[:5]:
             try:
+                if self.lsp is None:
+                    raise AttributeError("lsp is None")
                 abs_path = str((Path(self.project_root).resolve() / f).resolve())
                 diags = await self.lsp.diagnostics(abs_path)
                 diagnosis["diagnostics"].extend([{**d, "file": f} for d in diags[:5]])
             except Exception:
+                lsp_degraded = True
                 continue
+        if lsp_degraded or self.lsp is None:
+            await blackboard.add_insight(
+                "LSP unavailable — diagnose degraded to graph-only mode."
+            )
 
         # Try to identify root cause via symbol lookup and impact analysis
+        # Note: sym_result["text"] is the line content from code_search, NOT a
+        # symbol name. We must resolve it to the actual symbol via the AST indexer.
         for sym_result in diagnosis["relevant_symbols"][:3]:
-            sym_name = sym_result.get("text", "").strip()
-            if sym_name:
-                sym = self.graph.get_symbol(sym_name)
-                if sym:
-                    impact = impact_analysis(self.graph, self.ast_indexer, sym["name"], sym["file"])
-                    diagnosis["root_cause_candidates"].append({
-                        "symbol": sym["name"],
-                        "file": sym["file"],
-                        "line": sym["line"],
-                        "risk": impact.get("risk", "LOW"),
-                        "callers": impact.get("callers", 0),
-                    })
-                    await blackboard.add_symbols([sym["name"]])
+            matched_line = sym_result.get("line", 0)
+            sym_file = sym_result.get("file", "")
+            if not sym_file or not matched_line:
+                continue
+
+            # Resolve the nearest symbol via AST indexer (option b from the fix)
+            abs_path = str((Path(self.project_root).resolve() / sym_file).resolve())
+            file_symbols = self.ast_indexer.symbols_in_file(abs_path)
+            if not file_symbols:
+                # Fallback: extract candidate identifiers from the line text
+                # and try each one via graph.get_symbol until one resolves.
+                identifiers = re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{2,30}\b", sym_result.get("text", ""))
+                SKIP_KEYWORDS = {
+                    "def", "class", "return", "if", "else", "for", "while",
+                    "import", "from", "try", "except", "with", "as",
+                    "True", "False", "None", "and", "or", "not", "in", "is",
+                    "await", "async", "lambda", "yield", "pass", "break",
+                    "continue", "raise", "assert", "global", "nonlocal",
+                }
+                candidates = [i for i in identifiers if i.lower() not in SKIP_KEYWORDS]
+                sym_name = ""
+                for cand in candidates:
+                    if self.graph.get_symbol(cand):
+                        sym_name = cand
+                        break
+            else:
+                # Pick the symbol whose line is closest to the match
+                closest = min(
+                    file_symbols,
+                    key=lambda s: abs(int(s.get("line", 0)) - int(matched_line))
+                )
+                sym_name = closest.get("name", "")
+
+            if not sym_name:
+                continue
+
+            sym = self.graph.get_symbol(sym_name)
+            if sym:
+                impact = impact_analysis(self.graph, self.ast_indexer, sym["name"], sym["file"])
+                diagnosis["root_cause_candidates"].append({
+                    "symbol": sym["name"],
+                    "file": sym["file"],
+                    "line": sym["line"],
+                    "risk": impact.get("risk", "LOW"),
+                    "callers": impact.get("callers", 0),
+                })
+                await blackboard.add_symbols([sym["name"]])
 
         return SubAgentResult(
             role="diagnose", task=task, success=True,
-            data=diagnosis, token_estimate=len(str(diagnosis)) // 4,
+            data=diagnosis, token_estimate=_estimate_tokens(diagnosis),
         )
+
+
+# ── Capability Registration ──────────────────────────────────────────────────
+# Register all capabilities with their produces/consumes declarations.
+# This runs once at module load time so _CAPABILITY_REGISTRY is always in sync
+# with the actual handlers. The topological sort in _topo_sort guarantees that
+# producers execute before consumers that depend on their output.
+
+# Registry of capability name → Capability descriptor.
+# Populated once at module load; handlers are registered as unbound methods
+# and bound to `self` at call time in spawn_subagent.
+_CAPABILITY_REGISTRY: dict[str, Capability] = {}
+
+
+def _register_capability(name: str, handler: Callable[..., Awaitable[SubAgentResult]],
+                         produces: set[str], consumes: set[str] | None = None,
+                         retry_strategy: Literal["none", "broaden", "fallback"] = "none",
+                         max_retries: int = 1) -> None:
+    _CAPABILITY_REGISTRY[name] = Capability(
+        name=name,
+        handler=handler,
+        produces=produces,
+        consumes=consumes or set(),
+        retry_strategy=retry_strategy,
+        max_retries=max_retries,
+    )
+
+
+def _register_all_capabilities() -> None:
+    """Register all capabilities with their produces/consumes declarations.
+
+    Uses unbound methods so the registry is stable across orchestrator instances
+    (important for tests that create multiple orchestrators with different mocks).
+    Handlers are bound to `self` at call time in spawn_subagent.
+    """
+    _CAPABILITY_REGISTRY.clear()
+
+    _register_capability(
+        "search",
+        SubAgentOrchestrator._run_file_finder,
+        produces={"target_symbol", "target_file", "primary_definitions", "files",
+                 "search_seeded", "files_seeded"},
+        consumes=set(),
+        retry_strategy="broaden",
+        max_retries=2,
+    )
+    _register_capability(
+        "ast",
+        SubAgentOrchestrator._run_code_searcher,
+        produces={"ast_results", "exact_definitions"},
+        consumes={"target_symbol", "target_file"},
+        retry_strategy="broaden",
+        max_retries=2,
+    )
+    _register_capability(
+        "symbol",
+        SubAgentOrchestrator._run_symbol_searcher,
+        produces={"symbol_results", "search_results", "files", "symbols_seeded", "files_seeded"},
+        consumes=set(),
+        retry_strategy="broaden",
+        max_retries=2,
+    )
+    _register_capability(
+        "lsp",
+        SubAgentOrchestrator._run_lsp_review,
+        produces={"diagnostics", "checklist", "findings", "blocking_issues"},
+        consumes=set(),
+    )
+    _register_capability(
+        "graph",
+        SubAgentOrchestrator._run_graph_review,
+        produces={"impact", "checklist", "findings", "blocking_issues"},
+        consumes=set(),
+    )
+    _register_capability(
+        "graph_upstream",
+        SubAgentOrchestrator._run_test_impact,
+        produces={"tests_found", "files"},
+        consumes={"symbols"},
+        retry_strategy="broaden",
+        max_retries=2,
+    )
+    _register_capability(
+        "diagnose",
+        SubAgentOrchestrator._run_diagnose,
+        produces={"error_patterns", "relevant_symbols", "diagnostics",
+                 "root_cause_candidates", "suggested_files"},
+        consumes=set(),
+        retry_strategy="broaden",
+        max_retries=2,
+    )
+
+    # Keep _CAP_HANDLERS_KEYS in sync with the registry so that _run_decompose's
+    # planning prompt always matches the actual executor capabilities.
+    global _CAP_HANDLERS_KEYS
+    _CAP_HANDLERS_KEYS = list(_CAPABILITY_REGISTRY.keys())

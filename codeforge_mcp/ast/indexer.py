@@ -643,9 +643,14 @@ class ASTIndexer:
         source_bytes: bytes,
         query_str: str,
     ) -> list[dict[str, Any]]:
-        """Execute a tree-sitter query (S-expression) against the AST."""
+        """Execute a tree-sitter query (S-expression) against the AST.
+
+        Returns match dicts with {type, name, line, kind} to match the
+        keyword-mode interface expected by callers of run_ast_query().
+        """
         ts = _ensure_tree_sitter()
         results: list[dict[str, Any]] = []
+        _MAX_RESULTS = 1000
 
         try:
             query = ts.Query(tree.language, query_str)
@@ -654,9 +659,18 @@ class ASTIndexer:
             captures_dict = query.captures(tree.root_node)
             for cap_name, cap_nodes in captures_dict.items():
                 for node in cap_nodes:
+                    if len(results) >= _MAX_RESULTS:
+                        break
+                    node_type = node.type
+                    # Synthesise kind from KEYWORD_KINDS like keyword mode does
+                    kind = KEYWORD_KINDS.get(node_type, "unknown")
+                    # Try to extract a "name" from the node's identifier child
+                    name = _find_name(node, source_bytes)
                     results.append({
-                        "type": "query_match",
-                        "captures": {cap_name: _get_text(node, source_bytes)},
+                        "type": node_type,
+                        "name": name,
+                        "line": node.start_point[0] + 1,
+                        "kind": kind,
                     })
         except Exception as e:
             results.append({

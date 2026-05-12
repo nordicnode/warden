@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from codeforge_mcp.tools.understanding import (
+    ast_query,
     call_graph,
     impact_analysis,
     _detect_cycles,
@@ -121,6 +122,103 @@ class TestImpactAnalysis:
         result = impact_analysis(graph, None, "util_func")
         assert "modules" in result
         assert result["module_count"] >= 1
+
+
+class TestAstQuery:
+    """Verify ast_query runs tree-sitter queries and returns correct results."""
+
+    @pytest.fixture
+    def sample_file(self, tmp_path: Path) -> Path:
+        f = tmp_path / "sample.py"
+        f.write_text(
+            "def greet(name):\n"
+            "    return f'hello, {name}'\n"
+            "\n"
+            "class Greeter:\n"
+            "    def __init__(self, greeting):\n"
+            "        self.greeting = greeting\n"
+            "\n"
+            "    def greet(self, name):\n"
+            "        return f'{self.greeting}, {name}'\n"
+        )
+        return f
+
+    def test_ast_query_keyword_function(self, sample_file: Path) -> None:
+        pytest.importorskip("tree_sitter")
+        from codeforge_mcp.ast.indexer import ASTIndexer, KnowledgeGraph
+        db = sample_file.parent / "graph.db"
+        graph = KnowledgeGraph(str(db))
+        indexer = ASTIndexer(graph)
+
+        result = ast_query(indexer, str(sample_file), "function")
+        assert "error" not in result
+        names = [r["name"] for r in result]
+        assert "greet" in names
+
+    def test_ast_query_keyword_class(self, sample_file: Path) -> None:
+        pytest.importorskip("tree_sitter")
+        from codeforge_mcp.ast.indexer import ASTIndexer, KnowledgeGraph
+        db = sample_file.parent / "graph.db"
+        graph = KnowledgeGraph(str(db))
+        indexer = ASTIndexer(graph)
+
+        result = ast_query(indexer, str(sample_file), "class")
+        assert "error" not in result
+        names = [r["name"] for r in result]
+        assert "Greeter" in names
+
+    def test_ast_query_keyword_all(self, sample_file: Path) -> None:
+        pytest.importorskip("tree_sitter")
+        from codeforge_mcp.ast.indexer import ASTIndexer, KnowledgeGraph
+        db = sample_file.parent / "graph.db"
+        graph = KnowledgeGraph(str(db))
+        indexer = ASTIndexer(graph)
+
+        result = ast_query(indexer, str(sample_file), "all")
+        assert "error" not in result
+        assert len(result) > 0
+        # Every result must have type, name, line, kind
+        for r in result:
+            assert "type" in r
+            assert "line" in r
+
+    def test_ast_query_sexp_query(self, sample_file: Path) -> None:
+        pytest.importorskip("tree_sitter")
+        from codeforge_mcp.ast.indexer import ASTIndexer, KnowledgeGraph
+        db = sample_file.parent / "graph.db"
+        graph = KnowledgeGraph(str(db))
+        indexer = ASTIndexer(graph)
+
+        result = ast_query(indexer, str(sample_file), "(function_definition) @func")
+        assert "error" not in result
+        # S-expression results should now have {type, name, line, kind}
+        for r in result:
+            assert "type" in r
+            assert "line" in r
+            assert "kind" in r
+
+    def test_ast_query_nonexistent_file(self, sample_file: Path) -> None:
+        pytest.importorskip("tree_sitter")
+        from codeforge_mcp.ast.indexer import ASTIndexer, KnowledgeGraph
+        db = sample_file.parent / "graph.db"
+        graph = KnowledgeGraph(str(db))
+        indexer = ASTIndexer(graph)
+
+        result = ast_query(indexer, "/nonexistent/file.py", "function")
+        assert len(result) == 1
+        assert result[0]["type"] == "error"
+
+    def test_ast_query_unknown_keyword(self, sample_file: Path) -> None:
+        pytest.importorskip("tree_sitter")
+        from codeforge_mcp.ast.indexer import ASTIndexer, KnowledgeGraph
+        db = sample_file.parent / "graph.db"
+        graph = KnowledgeGraph(str(db))
+        indexer = ASTIndexer(graph)
+
+        result = ast_query(indexer, str(sample_file), "not_a_keyword")
+        assert len(result) == 1
+        assert result[0]["type"] == "error"
+        assert "Unknown query keyword" in result[0]["message"]
 
 
 class TestCycleDetection:

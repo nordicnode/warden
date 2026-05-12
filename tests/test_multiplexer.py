@@ -210,3 +210,303 @@ class TestDiagnosticsUsesNotify:
             "didClose must be a notification (no id). "
             "If id is present, the caller will wait for a response that never comes."
         )
+
+
+class TestDiagnosticsCoordinatesWithOpenedUris:
+    """diagnostics() must coordinate with _opened_uris to avoid duplicate didOpen."""
+
+    @pytest.fixture
+    def mux(self, tmp_path: Path) -> LSPMultiplexer:
+        (tmp_path / "test.py").write_text("x = 1\n")
+        return LSPMultiplexer(str(tmp_path))
+
+    @pytest.mark.asyncio
+    async def test_diagnostics_skips_didopen_when_uri_already_opened(self, mux: LSPMultiplexer) -> None:
+        """If URI is already in _opened_uris, diagnostics() sends didChange instead of didOpen.
+
+        hover() calls _ensure_document_open which adds the URI to state._opened_uris.
+        A subsequent diagnostics() call must NOT send another textDocument/didOpen
+        (some LSP servers reject duplicate opens). Instead it sends textDocument/didChange.
+        """
+        sent_messages: list[str] = []
+
+        async def capture(_proc: MagicMock, message: str) -> None:
+            sent_messages.append(message)
+
+        fake_state = _mock_state()
+        test_file = str(mux.project_root / "test.py")
+
+        with patch.object(mux, "_send_raw", side_effect=capture), \
+             patch.object(mux, "_ensure_server", return_value=fake_state), \
+             patch.object(mux, "_await_server_ready", return_value=None), \
+             patch.object(asyncio, "wait_for", new=AsyncMock()):
+
+            # Simulate hover() already having opened the file
+            fake_state._opened_uris.add(Path(test_file).resolve().as_uri())
+
+            await mux.diagnostics(test_file)
+
+        # Find all lifecycle messages
+        did_open_count = 0
+        did_change_count = 0
+        did_close_count = 0
+        for msg_str in sent_messages:
+            msg = json.loads(msg_str)
+            if msg.get("method") == "textDocument/didOpen":
+                did_open_count += 1
+            elif msg.get("method") == "textDocument/didChange":
+                did_change_count += 1
+            elif msg.get("method") == "textDocument/didClose":
+                did_close_count += 1
+
+        assert did_open_count == 0, (
+            "diagnostics() must NOT send didOpen when URI is already in _opened_uris. "
+            "Duplicate didOpen causes some LSP servers to reject the message."
+        )
+        assert did_change_count == 1, (
+            "diagnostics() should send didChange to refresh content for an already-open file."
+        )
+        assert did_close_count == 0, (
+            "diagnostics() must NOT send didClose when it did not open the file. "
+            "The file was opened by another operation (e.g., hover) and should stay open."
+        )
+
+    @pytest.mark.asyncio
+    async def test_diagnostics_sends_didclose_when_it_opened_the_file(self, mux: LSPMultiplexer) -> None:
+        """If diagnostics() itself opened the file, it MUST send didClose after waiting.
+
+        This ensures the URI is removed from _opened_uris so a future _ensure_document_open
+        will reopen with fresh contents rather than relying on stale server state.
+        """
+        sent_messages: list[str] = []
+
+        async def capture(_proc: MagicMock, message: str) -> None:
+            sent_messages.append(message)
+
+        fake_state = _mock_state()
+        test_file = str(mux.project_root / "test.py")
+
+        with patch.object(mux, "_send_raw", side_effect=capture), \
+             patch.object(mux, "_ensure_server", return_value=fake_state), \
+             patch.object(mux, "_await_server_ready", return_value=None), \
+             patch.object(asyncio, "wait_for", new=AsyncMock()):
+
+            # URI is NOT in _opened_uris — diagnostics() must open and close it
+            assert Path(test_file).resolve().as_uri() not in fake_state._opened_uris
+
+            await mux.diagnostics(test_file)
+
+        did_open_count = sum(
+            1 for msg_str in sent_messages
+            if json.loads(msg_str).get("method") == "textDocument/didOpen"
+        )
+        did_close_count = sum(
+            1 for msg_str in sent_messages
+            if json.loads(msg_str).get("method") == "textDocument/didClose"
+        )
+
+        assert did_open_count == 1, "diagnostics() must send didOpen when URI is not yet open"
+        assert did_close_count == 1, (
+            "diagnostics() must send didClose when it itself opened the file, "
+            "so _opened_uris is cleared and future _ensure_document_open reopens with fresh contents."
+        )
+
+    @pytest.mark.asyncio
+    async def test_hover_then_diagnostics_then_hover_second_hover_works(self, mux: LSPMultiplexer) -> None:
+        """hover() → diagnostics() → hover() sequence: second hover() must still return results.
+
+        When diagnostics() finds the URI already open (from hover()), it sends didChange
+        instead of didOpen and skips didClose, keeping the document open for the second hover().
+        """
+        sent_messages: list[dict[str, Any]] = []
+
+        async def capture(_proc: MagicMock, message: str) -> None:
+            sent_messages.append(json.loads(message))
+
+        fake_state = _mock_state()
+        test_file = str(mux.project_root / "test.py")
+        uri = Path(test_file).resolve().as_uri()
+
+        # Track hover call count to return appropriate responses
+        hover_call_count = 0
+
+        async def mock_lsp_request(state, method, params):
+            nonlocal hover_call_count
+            if method == "textDocument/hover":
+                hover_call_count += 1
+                # Resolve the pending future so hover() doesn't hang
+                req_id = mux._next_id_val() - 1
+                future = state.pending.get(req_id)
+                if future and not future.done():
+                    future.set_result({
+                        "id": req_id,
+                        "result": {
+                            "contents": {"value": "x: int"},
+                            "range": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": 1},
+                            },
+                        },
+                    })
+                return {
+                    "contents": {"value": "x: int"},
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 1}},
+                }
+            return None
+
+        with patch.object(mux, "_send_raw", side_effect=capture), \
+             patch.object(mux, "_ensure_server", return_value=fake_state), \
+             patch.object(mux, "_await_server_ready", return_value=None), \
+             patch.object(mux, "_lsp_request", side_effect=mock_lsp_request):
+
+            # First hover — opens the document via _ensure_document_open
+            result1 = await mux.hover(test_file, line=1, col=0)
+            assert result1 is not None, "First hover() should return results"
+            assert uri in fake_state._opened_uris, "hover() should add URI to _opened_uris"
+
+            # diagnostics() called while URI is already open
+            diag_result = await mux.diagnostics(test_file)
+
+            # URI should still be open (diagnostics() sent didChange, not didOpen, and no didClose)
+            assert uri in fake_state._opened_uris, (
+                "After diagnostics() with already-open URI, _opened_uris must still contain the URI. "
+                "diagnostics() should have skipped didOpen and didClose."
+            )
+
+            # Second hover — must still work
+            result2 = await mux.hover(test_file, line=1, col=0)
+            assert result2 is not None, (
+                "Second hover() after diagnostics() must still return results. "
+                "diagnostics() must not send didClose for a URI it did not open."
+            )
+            assert result2["value"] == "x: int"
+
+
+class TestServerClientRequests:
+    """Server→client requests must be acknowledged to prevent the server from hanging."""
+
+    @pytest.fixture
+    def mux(self, tmp_path: Path) -> LSPMultiplexer:
+        return LSPMultiplexer(str(tmp_path))
+
+    @pytest.mark.asyncio
+    async def test_workspace_configuration_request_responds_with_nulls(self, mux: LSPMultiplexer) -> None:
+        """workspace/configuration request: respond with [null, ...] per item.
+
+        LSP servers send workspace/configuration to request custom configuration.
+        We don't have custom config, so respond with nulls. The response must
+        be written to stdin of the subprocess.
+        """
+        sent_messages: list[str] = []
+        fake_state = _mock_state()
+
+        async def capture(_proc: MagicMock, message: str) -> None:
+            sent_messages.append(message)
+
+        with patch.object(mux, "_send_raw", side_effect=capture):
+            # Simulate the reader loop receiving a workspace/configuration request
+            # from the LSP server — method AND id present = server→client request
+            mux._handle_server_request(
+                fake_state,
+                "workspace/configuration",
+                req_id=42,
+                params={"items": [{"section": "pyright"}, {"section": "python.analysis"}]},
+            )
+            # Allow the async _send_response coroutine to run
+            await asyncio.sleep(0)
+
+        # Must have sent exactly one response message
+        assert len(sent_messages) == 1
+        resp = json.loads(sent_messages[0])
+        assert resp["jsonrpc"] == "2.0"
+        assert resp["id"] == 42
+        assert resp["result"] == [None, None]  # one null per config item
+
+    @pytest.mark.asyncio
+    async def test_client_register_capability_request_responds_with_empty_ack(self, mux: LSPMultiplexer) -> None:
+        """client/registerCapability: respond with {} to acknowledge dynamic capability registration."""
+        sent_messages: list[str] = []
+        fake_state = _mock_state()
+
+        async def capture(_proc: MagicMock, message: str) -> None:
+            sent_messages.append(message)
+
+        with patch.object(mux, "_send_raw", side_effect=capture):
+            mux._handle_server_request(
+                fake_state,
+                "client/registerCapability",
+                req_id=7,
+                params={"registrations": [{"id": "r1", "method": "workspace/didChangeConfiguration"}]},
+            )
+            await asyncio.sleep(0)
+
+        resp = json.loads(sent_messages[0])
+        assert resp["id"] == 7
+        assert resp["result"] == {}  # empty acknowledgement
+
+    @pytest.mark.asyncio
+    async def test_window_show_message_request_responds_with_null(self, mux: LSPMultiplexer) -> None:
+        """window/showMessageRequest: respond with null (no action taken)."""
+        sent_messages: list[str] = []
+        fake_state = _mock_state()
+
+        async def capture(_proc: MagicMock, message: str) -> None:
+            sent_messages.append(message)
+
+        with patch.object(mux, "_send_raw", side_effect=capture):
+            mux._handle_server_request(
+                fake_state,
+                "window/showMessageRequest",
+                req_id=99,
+                params={"type": 3, "message": "Apply changes?", "actions": [{"title": "Yes"}]},
+            )
+            await asyncio.sleep(0)
+
+        resp = json.loads(sent_messages[0])
+        assert resp["id"] == 99
+        assert resp["result"] is None  # no action taken
+
+    @pytest.mark.asyncio
+    async def test_reader_loop_routes_requests_to_handle_server_request(self, mux: LSPMultiplexer) -> None:
+        """_reader_loop's three-way dispatch: method+id → request handler, method only → notification.
+
+        We test the dispatch directly: _handle_server_request is called with a
+        server→client request (method AND id). It must send a response and NOT
+        throw. We also verify _handle_notification is a separate code path that
+        does not send responses.
+        """
+        fake_state = _mock_state()
+        sent_messages: list[str] = []
+
+        async def capture(_proc: MagicMock, message: str) -> None:
+            sent_messages.append(message)
+
+        with patch.object(mux, "_send_raw", side_effect=capture):
+            # Simulate _reader_loop receiving a server→client request:
+            # if method AND id present → _handle_server_request → response
+            mux._handle_server_request(
+                fake_state,
+                "workspace/configuration",
+                req_id=10,
+                params={"items": [{"section": "pyright"}]},
+            )
+            # Let the fire-and-forget response task complete
+            await asyncio.sleep(0)
+
+        # A JSON-RPC response MUST be written to stdin for a server→client request
+        assert len(sent_messages) == 1
+        resp = json.loads(sent_messages[0])
+        assert resp["jsonrpc"] == "2.0"
+        assert resp["id"] == 10
+        assert resp["result"] == [None]  # one null per config item
+
+        # Verify _handle_notification is a separate code path (method only, no response)
+        sent_messages.clear()
+        mux._handle_notification(fake_state, "textDocument/publishDiagnostics", {
+            "uri": "file:///test.py",
+            "diagnostics": [],
+        })
+        # Notifications don't write responses
+        assert len(sent_messages) == 0
