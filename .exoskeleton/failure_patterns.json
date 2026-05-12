@@ -1,0 +1,74 @@
+{
+  "patterns": [
+    {
+      "id": "FP-001",
+      "category": "boundary",
+      "name": "empty_array_input",
+      "description": "Function receives empty array where non-empty expected",
+      "trigger": "hasArrayOps",
+      "test_template": "expect(() => {MODULE}.{FUNCTION}([])).toThrow();",
+      "self_test": {
+        "source_file": "export function sum(arr: number[]): number { return arr.reduce((a,b)=>a+b,0); }",
+        "expected_tests": [
+          { "name": "adversarial_FP-001_sum", "pattern_id": "FP-001", "should_pass": true }
+        ]
+      }
+    },
+    {
+      "id": "FP-002",
+      "category": "null-safety",
+      "name": "null_argument",
+      "description": "Function receives null for expected object argument",
+      "trigger": "hasConditionals",
+      "test_template": "expect(() => {MODULE}.{FUNCTION}(null)).toThrow(); // Or handle gracefully",
+      "self_test": {
+        "source_file": "export function greet(name: string): string { return name ? `Hello ${name}` : 'Hello'; }",
+        "expected_tests": [
+          { "name": "adversarial_FP-002_greet", "pattern_id": "FP-002", "should_pass": true }
+        ]
+      }
+    },
+    {
+      "id": "FP-003",
+      "category": "type-coercion",
+      "name": "string_as_number",
+      "description": "Function receives a string that looks like a number",
+      "trigger": "hasNumericOps",
+      "test_template": "expect(() => {MODULE}.{FUNCTION}('42')).toThrow();",
+      "self_test": {
+        "source_file": "export function double(n: number): number { return n * 2; }",
+        "expected_tests": [
+          { "name": "adversarial_FP-003_double", "pattern_id": "FP-003", "should_pass": true }
+        ]
+      }
+    },
+    {
+      "id": "FP-004",
+      "category": "async",
+      "name": "promise_rejection",
+      "description": "Function properly handles rejected promises without crashing",
+      "trigger": "hasAsyncCode",
+      "test_template": "await expect({MODULE}.{FUNCTION}({})).resolves.toBeDefined();",
+      "self_test": {
+        "source_file": "export async function fetchData(url: string): Promise<any> { const r = await fetch(url); return r.json(); }",
+        "expected_tests": [
+          { "name": "adversarial_FP-004_fetchData", "pattern_id": "FP-004", "should_pass": false }
+        ]
+      }
+    },
+    {
+      "id": "FP-005",
+      "category": "off-by-one",
+      "name": "loop_boundary",
+      "description": "Function handles exactly the length of an array without accessing out of bounds",
+      "trigger": "hasLoops",
+      "test_template": "const arr = [1, 2, 3]; expect(() => {MODULE}.{FUNCTION}(arr)).not.toThrow();",
+      "self_test": {
+        "source_file": "export function countPositive(arr: number[]): number { let c=0; for(let i=0;i<arr.length;i++){ if(arr[i]>0)c++; } return c; }",
+        "expected_tests": [
+          { "name": "adversarial_FP-005_countPositive", "pattern_id": "FP-005", "should_pass": true }
+        ]
+      }
+    }
+  ]
+}
