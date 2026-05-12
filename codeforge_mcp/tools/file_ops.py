@@ -106,7 +106,8 @@ def write_file(
 
     # Don't write to .git or .codeforge internals
     rel = str(file_path.relative_to(root))
-    if rel.startswith(".git") or rel.startswith(".codeforge"):
+    rel_parts = Path(rel).parts
+    if rel_parts and rel_parts[0] in (".git", ".codeforge"):
         return {"error": f"Cannot write to protected path: {rel}", "written": False}
 
     # ── Escape warning: detect high density of literal \n sequences ─
@@ -382,6 +383,8 @@ def git_diff(
                 ["git", "-C", str(root)] + args,
                 capture_output=True, text=True, timeout=15,
             )
+            if proc.returncode != 0:
+                raise subprocess.CalledProcessError(proc.returncode, ["git"] + args, output=proc.stdout, stderr=proc.stderr)
             return proc.stdout, proc.stderr
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return "", ""

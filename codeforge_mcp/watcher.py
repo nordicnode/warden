@@ -104,21 +104,29 @@ class FileWatcher:
         # so watcher_status reflects recent activity immediately.
 
         def _accept_event(path_str: str) -> bool:
-            path = Path(path_str)
+            # Compute relative path to avoid incorrectly rejecting events when
+            # the project lives under a hidden ancestor directory
+            try:
+                rel_path = Path(path_str).resolve().relative_to(self.project_root.resolve())
+                parts = rel_path.parts
+            except ValueError:
+                parts = Path(path_str).parts
+
             # Skip hidden files, .git, .codeforge, node_modules, etc.
             # Exclude the leading "." part (current dir from relative paths)
             # so "./codeforge_mcp/tools/foo.py" isn't filtered out.
             if any(
                 part.startswith(".") and part not in (".", "..")
-                for part in path.parts
+                for part in parts
             ):
                 return False
-            if "node_modules" in path.parts or "target" in path.parts:
+            if "node_modules" in parts or "target" in parts:
                 return False
-            if "__pycache__" in path.parts:
+            if "__pycache__" in parts:
                 return False
-            
+
             # Special case for JS/TS project configs
+            path = Path(path_str)
             if path.name in ("tsconfig.json", "jsconfig.json"):
                 return True
 

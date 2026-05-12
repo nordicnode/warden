@@ -452,7 +452,7 @@ class SubAgentOrchestrator:
             "code_searcher": ["search", "ast", "symbol"],
             "reviewer": ["lsp", "graph"],
             "test_impact": ["graph_upstream"],
-            "diagnose": ["search", "lsp", "graph"],
+            "diagnose": ["diagnose"],
             "refactor_advisor": ["graph", "ast"],
             "security_auditor": ["ast", "search"],
             "doc_generator": ["ast", "lsp"],
@@ -514,6 +514,7 @@ class SubAgentOrchestrator:
             "lsp": self._run_reviewer, # aliased for now
             "graph": self._run_reviewer, # aliased for now
             "graph_upstream": self._run_test_impact,
+            "diagnose": self._run_diagnose,
         }
 
         # Deduplicate capabilities that resolve to the same handler, preserving order.
@@ -613,7 +614,11 @@ class SubAgentOrchestrator:
         # race on self.budget.
         n_agents = len(specs)
         remaining = self.budget.remaining
-        per_agent_budget = max(2000, remaining // max(n_agents, 1))
+        base = max(2000, remaining // max(n_agents, 1))
+        if base * n_agents > remaining:
+            per_agent_budget = remaining // max(n_agents, 1)
+        else:
+            per_agent_budget = base
 
         tasks = []
         for spec in specs:

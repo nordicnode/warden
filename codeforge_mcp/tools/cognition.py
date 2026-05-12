@@ -421,30 +421,44 @@ def _generate_markdown(
     # Find cross-cutting symbols used across multiple clusters
     if len(communities) > 1 and graph:
         try:
-            # Single GROUP BY query to find symbols appearing in 3+ distinct files
-            # — replaces the previous O(N²) per-symbol COUNT(*) loop
+            # Fetch all symbols with their files, then count distinct clusters in Python
             rows = graph.conn.execute(
-                """SELECT name, kind, MIN(file) AS file, MIN(signature) AS sig,
-                       MIN(doc) AS doc, COUNT(DISTINCT file) AS file_count
+                """SELECT name, kind, file, signature, doc
                 FROM symbols
-                GROUP BY name
-                HAVING file_count >= 3
-                ORDER BY file_count DESC
-                LIMIT 20"""
+                ORDER BY name"""
             ).fetchall()
 
+            # Group by symbol name
+            symbol_files: dict[str, list[tuple[str, str, str, str]]] = {}
+            for name, kind, file, sig, doc in rows:
+                if name not in symbol_files:
+                    symbol_files[name] = []
+                symbol_files[name].append((kind, file, sig or "", doc or ""))
+
             cross_cutting: list[dict[str, Any]] = []
-            for r in rows:
-                name, kind, file, sig, doc, file_count = r
-                if file in module_cluster:
+            for name, file_list in symbol_files.items():
+                # Count distinct clusters for this symbol
+                clusters_seen: set[int] = set()
+                for kind, file, sig, doc in file_list:
+                    cluster_id = module_cluster.get(file, -1)
+                    if cluster_id >= 0:
+                        clusters_seen.add(cluster_id)
+
+                # Only emit if symbol appears in 3+ distinct clusters
+                if len(clusters_seen) >= 3:
+                    # Use first occurrence for metadata
+                    kind, file, sig, doc = file_list[0]
                     cross_cutting.append({
                         "name": name,
                         "kind": kind,
                         "file": file,
-                        "sig": sig or "",
-                        "doc": doc or "",
-                        "refs_across": file_count,
+                        "sig": sig,
+                        "doc": doc,
+                        "refs_across": len(clusters_seen),
                     })
+
+            # Sort by cluster count descending
+            cross_cutting.sort(key=lambda x: x["refs_across"], reverse=True)
 
             if cross_cutting:
                 for cc in cross_cutting[:10]:
@@ -452,7 +466,7 @@ def _generate_markdown(
                     lines.append(
                         f"- {icon} **`{cc['name']}`** "
                         f"({cc['kind']}) — referenced across "
-                        f"{cc['refs_across']} files: {cc['doc'][:80]}\n"
+                        f"{cc['refs_across']} clusters: {cc['doc'][:80]}\n"
                     )
             else:
                 lines.append("*No cross-cutting symbols detected.*\n")

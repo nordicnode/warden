@@ -560,6 +560,7 @@ class LSPMultiplexer:
         # a 1s backoff before accepting empty as genuine.
         # Use truthiness check (not `is not None`) so empty lists also
         # trigger a retry — pyright returns [] when cold, not null.
+        result = None
         for attempt in range(3):
             result = await self._lsp_request(state, "textDocument/references", {
                 "textDocument": {"uri": uri},
@@ -660,6 +661,7 @@ class LSPMultiplexer:
 
         # Retry loop: LSP servers may return None while still warming up
         # Use truthiness check so empty dicts also trigger retry.
+        result = None
         for attempt in range(3):
             result = await self._lsp_request(state, "textDocument/hover", {
                 "textDocument": {"uri": uri},

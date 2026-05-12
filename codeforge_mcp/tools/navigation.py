@@ -198,6 +198,7 @@ def code_search(
     cmd.extend(_ignore_globs_for_rg())
     if not regex:
         cmd.append("--fixed-strings")
+    cmd.append("--")
     cmd.append(query)
     # Explicit search path prevents ripgrep from blocking on stdin when
     # run as a child process (MCP server) instead of searching the filesystem.
@@ -241,6 +242,7 @@ def code_search(
                 words = [w.strip() for w in query.split() if w.strip()]
                 if words:
                     fuzzy_pattern = "|".join(f".*?{re.escape(w)}.*?" for w in words)
+                    fuzzy_cmd.append("--")
                     fuzzy_cmd.append(fuzzy_pattern)
                     fuzzy_cmd.append(".")
                     try:
@@ -265,37 +267,41 @@ def code_search(
         # Parse ripgrep output
         current_file = ""
         current_lines: list[dict] = []
+        prefix_re = re.compile(r'^([^:]+):(\d+):(.*)')
+        prefix_ctx_re = re.compile(r'^([^-]+)-(\d+)-(.*)')
         for line in output.split("\n"):
             if line == "--":
                 if current_lines:
                     results.extend(current_lines)
                     current_lines = []
                 continue
-            
+
             # Match pattern: file:line:text (match) or file-line-text (context)
             # Ripgrep uses ':' for matches and '-' for context.
-            is_match = ":" in line
-            separator = ":" if is_match else "-"
-            
-            # Split by the first two separators to get file, line, and the rest (text)
-            parts = line.split(separator, 2)
-            if len(parts) >= 3 and parts[1].isdigit():
-                fname = parts[0]
-                lnum = int(parts[1])
-                text = parts[2]
-                
-                if current_file and fname != current_file:
-                    results.extend(current_lines)
-                    current_lines = []
-                
-                current_file = fname
-                current_lines.append({
-                    "file": fname,
-                    "line": lnum,
-                    "text": text,
-                    "is_match": is_match,
-                    "match_type": "match" if is_match else "context",
-                })
+            m = prefix_re.match(line)
+            if m:
+                fname, lnum, text = m.group(1), m.group(2), m.group(3)
+                is_match = True
+            else:
+                m = prefix_ctx_re.match(line)
+                if m:
+                    fname, lnum, text = m.group(1), m.group(2), m.group(3)
+                    is_match = False
+                else:
+                    continue
+
+            if current_file and fname != current_file:
+                results.extend(current_lines)
+                current_lines = []
+
+            current_file = fname
+            current_lines.append({
+                "file": fname,
+                "line": int(lnum),
+                "text": text,
+                "is_match": is_match,
+                "match_type": "match" if is_match else "context",
+            })
         results.extend(current_lines)
 
     except FileNotFoundError:

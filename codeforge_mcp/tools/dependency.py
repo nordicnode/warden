@@ -402,7 +402,11 @@ def _resolve_import(root: Path, from_file: str | Path, import_name: str) -> Path
     # Try typical resolution strategies for dotted names (order: local first)
     candidates: list[Path] = []
     rel_dir = from_file_path.parent
-    dotted_path = import_name.replace('.', '/')
+    # Preserve relative import specifiers (./foo, ../foo); only replace dots for absolute imports
+    if import_name.startswith('.'):
+        dotted_path = import_name
+    else:
+        dotted_path = import_name.replace('.', '/')
 
     # 1. Relative to importing file's directory (Python local imports)
     candidates.append(rel_dir / f"{dotted_path}.py")

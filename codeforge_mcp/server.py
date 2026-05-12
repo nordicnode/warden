@@ -596,7 +596,7 @@ async def write_file(path: str, content: str) -> dict[str, Any]:
     _ensure_init()
     existed_before, original_bytes = _capture_file_state(path)
     from codeforge_mcp.tools.file_ops import write_file as wf
-    result = wf(_project_root, path, content)
+    result = await asyncio.to_thread(wf, _project_root, path, content)
     if result.get("written"):
         line_count = max(1, len(content.split("\n")))
         review_payload = await _review_edit(path, 1, line_count)
@@ -1091,7 +1091,7 @@ async def test_run_affected(
         if len(impact) > 10: # High impact fallback
              _tool_timing("test_run_affected", t0, {"target": target, "fallback": "full_suite"})
              from codeforge_mcp.tools.execution import test_run
-             result = await asyncio.to_thread(test_run, "", _project_root) # Run full suite
+             result = await asyncio.to_thread(test_run, "", _project_root, summary_only=summary_only) # Run full suite
              return {
                  "tests_run": "full_suite",
                  "test_files": [],
@@ -1106,7 +1106,7 @@ async def test_run_affected(
 
     from codeforge_mcp.tools.execution import test_run
     selector = " ".join(sorted(test_files))
-    result = await asyncio.to_thread(test_run, selector, _project_root)
+    result = await asyncio.to_thread(test_run, selector, _project_root, summary_only=summary_only)
 
     _tool_timing("test_run_affected", t0, {"target": target, "files": len(test_files)})
     return {

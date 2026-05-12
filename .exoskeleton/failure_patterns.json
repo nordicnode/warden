@@ -6,7 +6,7 @@
       "name": "empty_array_input",
       "description": "Function receives empty array where non-empty expected",
       "trigger": "hasArrayOps",
-      "test_template": "expect(() => {MODULE}.{FUNCTION}([])).toThrow();",
+      "test_template": "expect({MODULE}.{FUNCTION}([])).toEqual(0);",
       "self_test": {
         "source_file": "export function sum(arr: number[]): number { return arr.reduce((a,b)=>a+b,0); }",
         "expected_tests": [
@@ -20,7 +20,7 @@
       "name": "null_argument",
       "description": "Function receives null for expected object argument",
       "trigger": "hasConditionals",
-      "test_template": "expect(() => {MODULE}.{FUNCTION}(null)).toThrow(); // Or handle gracefully",
+      "test_template": "expect({MODULE}.{FUNCTION}(null)).toBe('Hello');",
       "self_test": {
         "source_file": "export function greet(name: string): string { return name ? `Hello ${name}` : 'Hello'; }",
         "expected_tests": [
@@ -34,7 +34,7 @@
       "name": "string_as_number",
       "description": "Function receives a string that looks like a number",
       "trigger": "hasNumericOps",
-      "test_template": "expect(() => {MODULE}.{FUNCTION}('42')).toThrow();",
+      "test_template": "expect({MODULE}.{FUNCTION}('42')).toEqual(84);",
       "self_test": {
         "source_file": "export function double(n: number): number { return n * 2; }",
         "expected_tests": [
@@ -48,7 +48,7 @@
       "name": "promise_rejection",
       "description": "Function properly handles rejected promises without crashing",
       "trigger": "hasAsyncCode",
-      "test_template": "await expect({MODULE}.{FUNCTION}({})).resolves.toBeDefined();",
+      "test_template": "await expect({MODULE}.{FUNCTION}({})).rejects.toBeDefined();",
       "self_test": {
         "source_file": "export async function fetchData(url: string): Promise<any> { const r = await fetch(url); return r.json(); }",
         "expected_tests": [

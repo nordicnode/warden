@@ -63,7 +63,18 @@ async def safe_edit(
     """
     root = Path(project_root).resolve()
     file_path = (root / path).resolve()
+    if not str(file_path.resolve()).startswith(str(root.resolve())):
+        raise ValueError(f"Path {path} is outside project root")
     original_bytes = _read_existing_file_bytes(file_path)
+
+    # Capture pre-edit LSP diagnostics for baseline comparison
+    pre_diagnostics: list[dict[str, Any]] = []
+    if run_diagnostics and lsp_multiplexer is not None and file_path.exists():
+        try:
+            abs_path = str(file_path)
+            pre_diagnostics = await lsp_multiplexer.diagnostics(abs_path)
+        except Exception:
+            pass
 
     # Stage 1: Apply the patch (includes tree-sitter syntax validation)
     patch_result = patch_file(
@@ -136,11 +147,25 @@ async def safe_edit(
     if run_diagnostics and lsp_multiplexer is not None:
         try:
             abs_path = str(file_path)
-            lsp_diagnostics = await lsp_multiplexer.diagnostics(abs_path)
+            post_diagnostics = await lsp_multiplexer.diagnostics(abs_path)
+
+            # Compute new errors by comparing post-edit to pre-edit diagnostics
+            def diag_key(d: dict[str, Any]) -> tuple:
+                rng = d.get("range", {})
+                start = rng.get("start", {})
+                return (
+                    start.get("line", 0),
+                    start.get("character", 0),
+                    d.get("severity", 0),
+                    d.get("message", ""),
+                )
+
+            pre_keys = {diag_key(d) for d in pre_diagnostics}
             new_errors = [
-                d for d in lsp_diagnostics
-                if d.get("severity", 0) <= 2  # Error or Warning
+                d for d in post_diagnostics
+                if d.get("severity", 0) <= 2 and diag_key(d) not in pre_keys
             ]
+
             validation_stages.append({
                 "stage": "lsp_diagnostics",
                 "passed": len(new_errors) == 0,
@@ -269,7 +294,7 @@ async def _run_affected_tests(
                 continue
         
         if high_impact:
-            result = test_run(selector="", project_root=project_root) # Full suite
+            result = await asyncio.to_thread(test_run, "", project_root) # Full suite
             return {
                 "exit_code": result.get("exit_code", 1),
                 "tests_run": "full_suite",
@@ -288,7 +313,7 @@ async def _run_affected_tests(
 
     # Run only the affected test files
     selector = " ".join(sorted(test_files))
-    result = test_run(selector=selector, project_root=project_root)
+    result = await asyncio.to_thread(test_run, selector, project_root)
     return {
         "exit_code": result.get("exit_code", 1),
         "tests_run": len(test_files),
@@ -320,6 +345,7 @@ def _restore_original_file(file_path: Path, original_bytes: bytes | None) -> tup
     if original_bytes is None:
         return False, "Rollback unavailable: original file contents could not be captured."
     try:
+        # Path traversal check is already done in safe_edit before calling this function
         file_path.write_bytes(original_bytes)
         return True, "Patched content was reverted because syntax validation failed."
     except OSError as exc:
