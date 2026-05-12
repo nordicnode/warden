@@ -199,10 +199,12 @@ class FileWatcher:
             return
 
         if not path.is_file():
-            # File was deleted
-            rel = str(path.relative_to(self.project_root))
-            self.graph.delete_symbols_in_file(rel)
-            log.info("File deleted, symbols removed", file=rel)
+            # File was deleted — use the resolved absolute path to match
+            # what ast/indexer.py:_parse_and_index stores (it canonicalizes
+            # to str(path.resolve()) so the graph lookup succeeds).
+            abs_path = str(path.resolve())
+            self.graph.delete_symbols_in_file(abs_path)
+            log.info("File deleted, symbols removed", file=abs_path)
             self._invalidate_caches()
             return
 

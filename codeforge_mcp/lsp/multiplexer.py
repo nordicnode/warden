@@ -134,6 +134,9 @@ class _ServerState:
         # URIs that have been opened via textDocument/didOpen (avoids
         # duplicate opens which some LSP servers reject).
         self._opened_uris: set[str] = set()
+        # Per-URI document version counter for didChange messages.
+        # Initialized lazily but always present once any diagnostic opens a file.
+        self._opened_uris_versions: dict[str, int] = {}
         # Wall-clock timestamp at which the server finished `initialize`.
         # Used by query helpers to wait briefly while the server completes
         # its first workspace crawl (Phase 3 fix — addresses cold-start
@@ -303,12 +306,38 @@ class LSPMultiplexer:
         if remaining > 0:
             await asyncio.sleep(remaining)
 
+    def _handle_server_request(self, state: _ServerState, method: str, req_id: int, params: Any) -> None:
+        """Handle a server→client request and send back the appropriate response."""
+        if method == "workspace/configuration":
+            # workspace/configuration requests configuration items.
+            # Respond with null for each item (no custom config is available).
+            items = params.get("items", []) if isinstance(params, dict) else []
+            result = [None] * len(items) if items else []
+            asyncio.create_task(self._send_response(state, req_id, result))
+        elif method == "client/registerCapability":
+            # client/registerCapability is sent by the server to register
+            # dynamic capabilities. Acknowledge with an empty response.
+            asyncio.create_task(self._send_response(state, req_id, {}))
+        elif method == "window/workDoneProgress/create":
+            # window/workDoneProgress/create requests a progress token.
+            # Acknowledge with the created token.
+            token = params.get("token", 0) if isinstance(params, dict) else 0
+            asyncio.create_task(self._send_response(state, req_id, {"token": token}))
+        elif method == "window/showMessageRequest":
+            # window/showMessageRequest asks the client to show a message
+            # with action items. Respond with null (no action taken).
+            asyncio.create_task(self._send_response(state, req_id, None))
+        else:
+            # Unknown or unimplemented request — acknowledge with null
+            # to prevent the server from hanging on an unhandled request.
+            asyncio.create_task(self._send_response(state, req_id, None))
+
     async def _reader_loop(self, state: _ServerState) -> None:
         """Single reader task: read all messages from stdout and dispatch.
 
         - Messages with 'id' but no 'method' → response → resolve pending future
-        - Messages with 'method' → notification → route to handler
-        - Messages with both 'id' and 'method' → server→client request (ignored)
+        - Messages with 'method' but no 'id' → notification → route to handler
+        - Messages with both 'id' and 'method' → server→client request → respond
         """
         proc = state.proc
         if proc.stdout is None:
@@ -321,10 +350,14 @@ class LSPMultiplexer:
 
                 msg_id = msg.get("id")
                 method = msg.get("method", "")
+                params = msg.get("params", {})
 
-                if method:
-                    # Notification or server→client request: route by method
-                    self._handle_notification(state, method, msg.get("params", {}))
+                if method and msg_id is not None:
+                    # Server→client request: respond with appropriate result
+                    self._handle_server_request(state, method, msg_id, params)
+                elif method:
+                    # Notification: route to handler (no response expected)
+                    self._handle_notification(state, method, params)
                 elif msg_id is not None:
                     # Response: resolve the pending future
                     future = state.pending.pop(msg_id, None)
@@ -392,6 +425,15 @@ class LSPMultiplexer:
             if event is not None:
                 event.set()
 
+    async def _send_response(self, state: _ServerState, req_id: int, result: Any) -> None:
+        """Send a JSON-RPC response back to the LSP server."""
+        response = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": result,
+        }
+        await self._send_raw(state.proc, json.dumps(response))
+
     async def _send_raw(self, proc: asyncio.subprocess.Process, message: str) -> None:
         if proc.stdin is None:
             return
@@ -440,6 +482,13 @@ class LSPMultiplexer:
     async def diagnostics(self, file_path: str) -> list[dict[str, Any]]:
         """Get diagnostics for a file by opening it and waiting for publishDiagnostics.
 
+        Coordinates with _opened_uris to avoid duplicate didOpen. If the URI is
+        already open (e.g., from a prior hover() or goto_definition() call),
+        skips the duplicate didOpen and instead sends a didChange with current
+        content to refresh the server's view. Only sends didClose if diagnostics()
+        itself opened the file, and removes the URI from _opened_uris so a future
+        _ensure_document_open will reopen with fresh contents.
+
         Uses an asyncio.Event per URI to wait for the notification.
         Increased timeout (30s) because some servers (pyright) can be slow
         on first analysis of a large project.
@@ -468,19 +517,45 @@ class LSPMultiplexer:
         if existing is not None:
             return existing
 
-        # Create the event BEFORE sending didOpen to avoid missing fast notifications
+        # Determine whether diagnostics() itself is opening this file or if
+        # it was already opened by another operation (e.g., hover, goto_definition).
+        # If already open, we skip didOpen and will NOT send didClose to keep
+        # the file available for other operations.
+        already_open = uri in state._opened_uris
+
+        # Create the event BEFORE sending didOpen/didChange to avoid missing fast notifications
         event = asyncio.Event()
         state.diag_events[uri] = event
 
-        # Open the file (notification)
-        await self._lsp_notify(state, "textDocument/didOpen", {
-            "textDocument": {
-                "uri": uri,
-                "languageId": lang,
-                "version": 1,
-                "text": content,
-            },
-        })
+        if already_open:
+            # File is already open via _ensure_document_open (e.g., from hover).
+            # Send a didChange to refresh the server's view with current content
+            # instead of sending a duplicate didOpen which some LSP servers reject.
+            await self._lsp_notify(state, "textDocument/didChange", {
+                "textDocument": {
+                    "uri": uri,
+                    "version": state._opened_uris_versions.get(uri, 1) + 1,
+                },
+                "contentChanges": [
+                    {"text": content}
+                ],
+            })
+        else:
+            # File not yet open — diagnostics() is responsible for opening it.
+            # Send didOpen and track it so we can send didClose when done.
+            await self._lsp_notify(state, "textDocument/didOpen", {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": lang,
+                    "version": 1,
+                    "text": content,
+                },
+            })
+            state._opened_uris.add(uri)
+            # Track the version for subsequent didChange calls
+            if not hasattr(state, "_opened_uris_versions"):
+                state._opened_uris_versions = {}
+            state._opened_uris_versions[uri] = 1
 
         # Wait for the publishDiagnostics notification.
         # Servers like pyright can take several seconds on the first
@@ -490,10 +565,16 @@ class LSPMultiplexer:
         except asyncio.TimeoutError:
             pass
 
-        # Close the file (notification)
-        await self._lsp_notify(state, "textDocument/didClose", {
-            "textDocument": {"uri": uri},
-        })
+        # Only send didClose if diagnostics() itself opened the file.
+        # Removing the URI from _opened_uris ensures a future _ensure_document_open
+        # will reopen with fresh contents.
+        if not already_open:
+            await self._lsp_notify(state, "textDocument/didClose", {
+                "textDocument": {"uri": uri},
+            })
+            state._opened_uris.discard(uri)
+            if hasattr(state, "_opened_uris_versions"):
+                state._opened_uris_versions.pop(uri, None)
 
         # Cleanup
         state.diag_events.pop(uri, None)
@@ -899,20 +980,16 @@ class LSPMultiplexer:
         """Clear the LSP result cache.
 
         Args:
-            file_uri: If provided, only clear entries containing this URI.
-                      If None (default), clear the entire cache.
+            file_uri: If provided, clear the ENTIRE cache. Any file edit can
+                      affect symbol results (new/removed definitions), workspace
+                      symbols, and references — micro-optimizing which entries
+                      to invalidate is error-prone. If None (default), also
+                      clears the entire cache and resets the active-languages
+                      set so the next symbol_lookup call rediscovers the project.
         """
-        if file_uri is None:
-            self._cache.clear()
-            # Also reset the cached active-languages set so the next
-            # symbol_lookup call rediscovers the project layout.
-            if hasattr(self, "_active_langs"):
-                delattr(self, "_active_langs")
-        else:
-            # Remove all cache entries that reference this URI
-            to_remove = [key for key, val in self._cache.items() if file_uri in key]
-            for key in to_remove:
-                del self._cache[key]
+        self._cache.clear()
+        if hasattr(self, "_active_langs"):
+            delattr(self, "_active_langs")
 
     async def shutdown(self) -> None:
         for state in self._states.values():

@@ -5,6 +5,7 @@ These are the fundamental primitives that let an AI agent view and edit code.
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 from pathlib import Path
@@ -236,16 +237,48 @@ def list_directory(
         except PermissionError:
             return
         for entry in entries:
-            entry_path = str(entry.resolve())
-            if entry_path in seen:
+            # Resolve symlinks and verify the entry stays within the project root.
+            # This prevents reporting file metadata or descending into directories
+            # that live outside the project via symlink traversal.
+            try:
+                resolved = entry.resolve()
+            except (OSError, RuntimeError):
+                # Could not resolve (broken symlink, permission error, etc.) — skip.
+                logging.getLogger(__name__).debug(
+                    "Skipping unresolvable entry %s: %s", entry, entry
+                )
                 continue
-            seen.add(entry_path)
+
+            # Verify the resolved path is inside the project root.
+            # This also catches symlinks that escape via '..' components or
+            # symlinks to absolute paths outside the root.
+            try:
+                resolved.relative_to(root)
+            except ValueError:
+                # Symlink resolves outside project root — skip it and log.
+                logging.getLogger(__name__).info(
+                    "Skipping symlink that escapes project root: %s -> %s",
+                    entry, resolved,
+                )
+                continue
+
+            # Use the original (unresolved) entry path for dedup, so that
+            # in-project symlinks to files are listed as their own entry even
+            # if they resolve to the same on-disk inode as an existing file.
+            # The traversal check above already ensured `resolved` is safe.
+            entry_key = str(entry)
+            if entry_key in seen:
+                continue
+            seen.add(entry_key)
             name = entry.name
             if not show_hidden and name.startswith("."):
                 continue
             if _skip_entry(entry):
                 continue
-            if entry.is_dir():
+            # Check type via the resolved (safe) path to correctly handle symlinks.
+            is_dir = resolved.is_dir()
+            is_file = resolved.is_file()
+            if is_dir:
                 total_dirs += 1
                 files.append({
                     "name": name,
@@ -255,10 +288,10 @@ def list_directory(
                 })
                 if current_depth < depth:
                     _walk(entry, current_depth + 1)
-            elif entry.is_file():
+            elif is_file:
                 total_files += 1
                 try:
-                    size = entry.stat().st_size
+                    size = resolved.stat().st_size
                 except OSError:
                     size = 0
                 files.append({

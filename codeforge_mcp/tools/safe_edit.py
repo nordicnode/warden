@@ -63,8 +63,13 @@ async def safe_edit(
     """
     root = Path(project_root).resolve()
     file_path = (root / path).resolve()
-    if not str(file_path.resolve()).startswith(str(root.resolve())):
-        raise ValueError(f"Path {path} is outside project root")
+    try:
+        file_path.relative_to(root)
+    except ValueError:
+        return ToolResponse.error(
+            ErrorCode.FILE_TRAVERSAL_DENIED,
+            f"Path outside project root: {path}",
+        ).model_dump()
     original_bytes = _read_existing_file_bytes(file_path)
 
     # Capture pre-edit LSP diagnostics for baseline comparison
@@ -151,11 +156,13 @@ async def safe_edit(
 
             # Compute new errors by comparing post-edit to pre-edit diagnostics
             def diag_key(d: dict[str, Any]) -> tuple:
-                rng = d.get("range", {})
-                start = rng.get("start", {})
+                # Diagnostics from multiplexer._handle_notification are already
+                # flattened to {line, severity, message, source} — NOT nested
+                # {range: {start: {line, character}}}. Use d.get() to safely
+                # access the flattened shape.
                 return (
-                    start.get("line", 0),
-                    start.get("character", 0),
+                    d.get("line", 0),
+                    d.get("character", 0),
                     d.get("severity", 0),
                     d.get("message", ""),
                 )
@@ -173,7 +180,10 @@ async def safe_edit(
                 "warning_count": len([d for d in new_errors if d.get("severity") == 2]),
                 "details": [
                     {
-                        "line": d.get("range", {}).get("start", {}).get("line", 0) + 1,
+                        # Use flattened diagnostic shape: d.get("line", 0)
+                        # already +1 adjusted in _handle_notification
+                        "line": d.get("line", 0),
+                        "character": d.get("character", 0),
                         "severity": "error" if d.get("severity") == 1 else "warning",
                         "message": d.get("message", ""),
                     }

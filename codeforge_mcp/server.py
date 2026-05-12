@@ -8,10 +8,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import signal
 import sys
 import threading
 import time
+
+# Compiled once — used by test_run_affected is_test heuristic
+_IS_TEST_PATTERN = re.compile(r"(^|/)(test_|_test\.|tests?/|\.spec\.|\.test\.)", re.IGNORECASE)
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +28,43 @@ from codeforge_mcp.subagents import SubAgentOrchestrator
 from codeforge_mcp.indexer import index_project, find_project_root
 from codeforge_mcp import logging as log
 from codeforge_mcp.logging import sanitize_command
+from codeforge_mcp.tools.responses import ToolResponse, ErrorCode
+
+
+# ── Path validation helper ───────────────────────────────────────────
+
+class _PathTraversalError(Exception):
+    """Raised by _ensure_within_root when a path escapes the project root.
+
+    Carries a ToolResponse-shaped dict so callers can return it directly
+    as a tool response (with success=False and the appropriate error code).
+    """
+    def __init__(self, error_dict: dict[str, Any]) -> None:
+        super().__init__(error_dict['error_message'])
+        self.error_dict = error_dict
+
+
+def _ensure_within_root(path: Path) -> Path:
+    """Validate that a Path is inside the project root.
+
+    Resolves the path (relative to project root, absolute as-is) and checks
+    that the result is contained within _project_root.resolve(). Raises
+    _PathTraversalError (carrying a ToolResponse dict) if the path escapes.
+    """
+    root = Path(_project_root).resolve()
+    if path.is_absolute():
+        resolved = path.resolve()
+    else:
+        resolved = (root / path).resolve()
+    try:
+        resolved.relative_to(root)
+        return resolved
+    except ValueError:
+        raise _PathTraversalError(ToolResponse.error(
+            ErrorCode.FILE_TRAVERSAL_DENIED,
+            f"Path outside project root: {path}",
+        ).model_dump())
+
 
 # ── Globals ──────────────────────────────────────────────────────────
 
@@ -153,10 +194,10 @@ async def _reindex_after_edit(path: str) -> None:
     if Path(abs_path).exists():
         await asyncio.to_thread(_ast_indexer.index_file_incremental, abs_path)
         return
-    rel_path = path
+    # File deleted — use the resolved absolute path (consistent with what
+    # ast/indexer.py stores via path_obj.resolve()), so the graph lookup
+    # succeeds and symbols are correctly removed.
     await asyncio.to_thread(_graph.delete_symbols_in_file, abs_path)
-    if rel_path != abs_path:
-        await asyncio.to_thread(_graph.delete_symbols_in_file, rel_path)
 
 
 async def _review_edit(
@@ -361,6 +402,10 @@ async def ast_query(file: str, xpath: str) -> dict[str, Any]:
     """
     t0 = time.time()
     _ensure_init()
+    try:
+        _ensure_within_root(Path(file))
+    except _PathTraversalError as e:
+        return e.error_dict
     from codeforge_mcp.tools.understanding import ast_query as aq
     full_path = Path(_project_root) / file
     try:
@@ -399,6 +444,11 @@ async def call_graph(
     """Traverse the call graph from a symbol."""
     t0 = time.time()
     _ensure_init()
+    if file:
+        try:
+            _ensure_within_root(Path(file))
+        except _PathTraversalError as e:
+            return e.error_dict
     from codeforge_mcp.tools.understanding import call_graph as cg
     file_path = str(Path(_project_root) / file) if file else None
     try:
@@ -423,6 +473,11 @@ async def impact_analysis(target: str, file: str = "") -> dict[str, Any]:
     """Analyze the blast radius of changing a symbol."""
     t0 = time.time()
     _ensure_init()
+    if file:
+        try:
+            _ensure_within_root(Path(file))
+        except _PathTraversalError as e:
+            return e.error_dict
     from codeforge_mcp.tools.understanding import impact_analysis as ia
     file_path = str(Path(_project_root) / file) if file else None
     result = await asyncio.to_thread(ia, _graph, _ast_indexer, target, file_path)
@@ -463,6 +518,11 @@ async def ast_dependency_graph(focus_file: str = "", max_files: int = 200) -> di
     """Build a module-level dependency graph from import statements."""
     t0 = time.time()
     _ensure_init()
+    if focus_file:
+        try:
+            _ensure_within_root(Path(focus_file))
+        except _PathTraversalError as e:
+            return e.error_dict
     from codeforge_mcp.tools.dependency import ast_dependency_graph as adg
     try:
         result = await asyncio.to_thread(adg, _ast_indexer, _project_root, focus_file or None, max_files)
@@ -488,6 +548,10 @@ async def lsp_goto_definition(file: str, line: int, col: int = 0) -> dict[str, A
     """
     t0 = time.time()
     _ensure_init()
+    try:
+        _ensure_within_root(Path(file))
+    except _PathTraversalError as e:
+        return e.error_dict
     if _lsp is None:
         return {"found": False, "error": "LSP not initialized"}
     full_path = str(Path(_project_root) / file)
@@ -512,6 +576,10 @@ async def lsp_find_references(file: str, line: int, col: int = 0) -> dict[str, A
     """
     t0 = time.time()
     _ensure_init()
+    try:
+        _ensure_within_root(Path(file))
+    except _PathTraversalError as e:
+        return e.error_dict
     if _lsp is None:
         return {"success": False, "references": [], "error": "LSP not initialized"}
     full_path = str(Path(_project_root) / file)
@@ -537,6 +605,10 @@ async def lsp_hover(file: str, line: int, col: int = 0) -> dict[str, Any]:
     """
     t0 = time.time()
     _ensure_init()
+    try:
+        _ensure_within_root(Path(file))
+    except _PathTraversalError as e:
+        return e.error_dict
     if _lsp is None:
         return {"found": False, "error": "LSP not initialized"}
     full_path = str(Path(_project_root) / file)
@@ -558,6 +630,10 @@ async def lsp_diagnostics(file: str) -> dict[str, Any]:
     """
     t0 = time.time()
     _ensure_init()
+    try:
+        _ensure_within_root(Path(file))
+    except _PathTraversalError as e:
+        return e.error_dict
     if _lsp is None:
         return {"success": False, "diagnostics": [], "error": "LSP not initialized"}
     full_path = str(Path(_project_root) / file)
@@ -583,6 +659,10 @@ async def read_file(path: str, start_line: int = 0, end_line: int = 0) -> dict[s
     """Read a file from the project, optionally with line range."""
     t0 = time.time()
     _ensure_init()
+    try:
+        _ensure_within_root(Path(path))
+    except _PathTraversalError as e:
+        return e.error_dict
     from codeforge_mcp.tools.file_ops import read_file as rf
     result = await asyncio.to_thread(rf, _project_root, path, start_line, end_line)
     _tool_timing("read_file", t0, {"path": path, "start_line": start_line, "end_line": end_line})
@@ -594,6 +674,10 @@ async def write_file(path: str, content: str) -> dict[str, Any]:
     """Write content to a file within the project."""
     t0 = time.time()
     _ensure_init()
+    try:
+        _ensure_within_root(Path(path))
+    except _PathTraversalError as e:
+        return e.error_dict
     existed_before, original_bytes = _capture_file_state(path)
     from codeforge_mcp.tools.file_ops import write_file as wf
     result = await asyncio.to_thread(wf, _project_root, path, content)
@@ -621,6 +705,10 @@ async def list_directory(path: str = "", depth: int = 2, show_hidden: bool = Fal
     """List files and directories in a project subdirectory."""
     t0 = time.time()
     _ensure_init()
+    try:
+        _ensure_within_root(Path(path) if path else Path(_project_root))
+    except _PathTraversalError as e:
+        return e.error_dict
     from codeforge_mcp.tools.file_ops import list_directory as ld
     result = await asyncio.to_thread(ld, _project_root, path, depth, show_hidden)
     _tool_timing("list_directory", t0, {"path": path, "depth": depth, "show_hidden": show_hidden})
@@ -906,6 +994,10 @@ async def patch_file_tool(
 ) -> dict[str, Any]:
     """Apply a line-range patch with hash verification and syntax validation."""
     _ensure_init()
+    try:
+        _ensure_within_root(Path(path))
+    except _PathTraversalError as e:
+        return e.error_dict
     existed_before, original_bytes = _capture_file_state(path)
     from codeforge_mcp.tools.patch import patch_file as pf
     result = pf(
@@ -954,6 +1046,10 @@ async def safe_edit_tool(
 ) -> dict[str, Any]:
     """Apply a code edit with multi-stage validation pipeline."""
     _ensure_init()
+    try:
+        _ensure_within_root(Path(path))
+    except _PathTraversalError as e:
+        return e.error_dict
     existed_before, original_bytes = _capture_file_state(path)
     from codeforge_mcp.tools.safe_edit import safe_edit as se
     result = await se(
@@ -1038,14 +1134,22 @@ async def test_run_affected(
         if not fname:
             continue
         
-        # Heuristic for test files
+        # Heuristic for test files: regex on stem + standard test directory conventions
         p = Path(fname)
+        stem_lower = p.stem.lower()
+        path_str = str(p).replace(os.sep, "/")
         is_test = (
-            "tests" in p.parts or 
-            "spec" in p.parts or
-            p.name.startswith("test_") or 
-            p.name.endswith("_test.py") or
-            "test" in p.name.lower() and p.suffix in (".py", ".ts", ".js", ".rs", ".go") and any(x in p.name.lower() for x in ("test", "spec"))
+            _IS_TEST_PATTERN.search(stem_lower) is not None
+            or "/tests/" in path_str
+            or "/test/" in path_str
+            or "/__tests__/" in path_str
+            or "/__spec__/" in path_str
+            or "/spec/" in path_str
+            or path_str.startswith("tests/")
+            or path_str.startswith("test/")
+            or path_str.startswith("__tests__/")
+            or path_str.startswith("__spec__/")
+            or path_str.startswith("spec/")
         )
         if is_test:
             try:

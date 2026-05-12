@@ -14,6 +14,7 @@ import re
 import shlex
 import signal
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -107,14 +108,31 @@ async def bash_run(
     node_bin = str(work_dir / "node_modules" / ".bin")
     env["PATH"] = f"{venv_bin}:{node_bin}:{env.get('PATH', '')}"
 
-    # Generate a global .ripgreprc to protect raw LLM ripgrep calls
-    rc_path = "/tmp/.codeforge_ripgreprc"
-    if not os.path.exists(rc_path):
-        with open(rc_path, "w") as f:
-            for d in [".venv", "venv", "env", "node_modules", "dist", "build", ".git", ".codeforge"]:
-                f.write(f"--glob=!{d}/\n")
-                f.write(f"--glob=!**/{d}/**\n")
-    env["RIPGREP_CONFIG_PATH"] = rc_path
+    # Generate a global .ripgreprc to protect raw LLM ripgrep calls.
+    # Use mkstemp with O_EXCL semantics so the filename is unpredictable
+    # and the call fails (rather than overwrites) if the file already exists.
+    rc_fd = None
+    rc_path = None
+    try:
+        rc_fd, rc_path = tempfile.mkstemp(prefix=".codeforge_ripgreprc_")
+        os.write(rc_fd, b"\n".join(
+            f"--glob=!{d}/\n--glob=!**/{d}/**\n".encode()
+            for d in [".venv", "venv", "env", "node_modules", "dist", "build", ".git", ".codeforge"]
+        ))
+        os.close(rc_fd)
+        rc_fd = None
+        env["RIPGREP_CONFIG_PATH"] = rc_path
+    finally:
+        if rc_fd is not None:
+            try:
+                os.close(rc_fd)
+            except OSError:
+                pass
+        if rc_path is not None:
+            try:
+                os.unlink(rc_path)
+            except OSError:
+                pass
 
     try:
         proc = await asyncio.create_subprocess_exec(

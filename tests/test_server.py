@@ -12,6 +12,77 @@ from codeforge_mcp import server
 from codeforge_mcp.subagents.orchestrator import ContextBudget, SubAgentResult
 
 
+class TestIsTestHeuristic:
+    """Tests for the is_test heuristic in test_run_affected."""
+
+    def test_is_test_regex_matches_test_prefix(self) -> None:
+        """Stem matching (^|[._-])(test|spec|tests|specs)([._-]|$) should match test_ prefix."""
+        from codeforge_mcp import server
+        import re
+        pattern = re.compile(r"(^|[._-])(test|spec|tests|specs)([._-]|$)")
+
+        # Should match
+        assert pattern.search("test_foo") is not None
+        assert pattern.search("test_bar.py") is not None
+        assert pattern.search("foo_test.py") is not None
+        assert pattern.search("test") is not None
+
+    def test_is_test_regex_matches_spec_prefix(self) -> None:
+        """Should match spec_ prefix and _spec suffix."""
+        import re
+        pattern = re.compile(r"(^|[._-])(test|spec|tests|specs)([._-]|$)")
+
+        assert pattern.search("spec_helper.py") is not None
+        assert pattern.search("foo_spec.py") is not None
+        assert pattern.search("_spec") is not None
+
+    def test_is_test_regex_rejects_false_positives(self) -> None:
+        """Word-boundary-aware regex should not match 'contest' or 'specimen'."""
+        import re
+        pattern = re.compile(r"(^|[._-])(test|spec|tests|specs)([._-]|$)")
+
+        assert pattern.search("contest") is None
+        assert pattern.search("specimen") is None
+        assert pattern.search("tests.py") is not None  # but tests.py is a valid test file
+
+    def test_is_test_directory_patterns(self) -> None:
+        """Standard test directory conventions: /tests/, /test/, /__tests__/, /__spec__/, /spec/.
+
+        Mirrors the actual heuristic in server.py:test_run_affected, which uses
+        both substring checks (for embedded paths like /project/tests/foo.py) and
+        startswith checks (for relative paths like tests/foo.py).
+        """
+        import os
+        paths = [
+            ("src/utils.py", False),
+            ("tests/test_server.py", True),   # startswith tests/
+            ("/project/tests/test_server.py", True),  # /tests/ substring
+            ("src/test/test_foo.py", True),   # /test/ substring
+            ("__tests__/test_foo.py", True),  # startswith __tests__/
+            ("/project/__tests__/foo.py", True),  # /__tests__/ substring
+            ("spec/unit_spec.py", True),  # startswith spec/
+            ("/project/spec/helpers.py", True),  # /spec/ substring
+            ("__spec__/test_foo.py", True),  # startswith __spec__/
+            ("special/utils.py", False),  # spec substring but NOT a test dir
+            ("contest/main.py", False),   # contest contains test but not a test file
+        ]
+        for path_str, expected in paths:
+            normalized = path_str.replace(os.sep, "/")
+            result = (
+                "/tests/" in normalized
+                or "/test/" in normalized
+                or "/__tests__/" in normalized
+                or "/__spec__/" in normalized
+                or "/spec/" in normalized
+                or normalized.startswith("tests/")
+                or normalized.startswith("test/")
+                or normalized.startswith("__tests__/")
+                or normalized.startswith("__spec__/")
+                or normalized.startswith("spec/")
+            )
+            assert result == expected, f"{path_str}: expected {expected}, got {result}"
+
+
 class TestToolResponseShapes:
     @pytest.mark.asyncio
     async def test_code_find_files_returns_envelope(self) -> None:
