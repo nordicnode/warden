@@ -18,6 +18,7 @@ from codeforge_mcp.tools.understanding import (
     _detect_cycles,
 )
 from codeforge_mcp.graph import KnowledgeGraph
+from codeforge_mcp.ast.indexer import ASTIndexer
 
 
 class TestCallGraph:
@@ -145,7 +146,6 @@ class TestAstQuery:
 
     def test_ast_query_keyword_function(self, sample_file: Path) -> None:
         pytest.importorskip("tree_sitter")
-        from codeforge_mcp.ast.indexer import ASTIndexer, KnowledgeGraph
         db = sample_file.parent / "graph.db"
         graph = KnowledgeGraph(str(db))
         indexer = ASTIndexer(graph)
@@ -157,7 +157,6 @@ class TestAstQuery:
 
     def test_ast_query_keyword_class(self, sample_file: Path) -> None:
         pytest.importorskip("tree_sitter")
-        from codeforge_mcp.ast.indexer import ASTIndexer, KnowledgeGraph
         db = sample_file.parent / "graph.db"
         graph = KnowledgeGraph(str(db))
         indexer = ASTIndexer(graph)
@@ -169,7 +168,6 @@ class TestAstQuery:
 
     def test_ast_query_keyword_all(self, sample_file: Path) -> None:
         pytest.importorskip("tree_sitter")
-        from codeforge_mcp.ast.indexer import ASTIndexer, KnowledgeGraph
         db = sample_file.parent / "graph.db"
         graph = KnowledgeGraph(str(db))
         indexer = ASTIndexer(graph)
@@ -184,7 +182,6 @@ class TestAstQuery:
 
     def test_ast_query_sexp_query(self, sample_file: Path) -> None:
         pytest.importorskip("tree_sitter")
-        from codeforge_mcp.ast.indexer import ASTIndexer, KnowledgeGraph
         db = sample_file.parent / "graph.db"
         graph = KnowledgeGraph(str(db))
         indexer = ASTIndexer(graph)
@@ -199,7 +196,6 @@ class TestAstQuery:
 
     def test_ast_query_nonexistent_file(self, sample_file: Path) -> None:
         pytest.importorskip("tree_sitter")
-        from codeforge_mcp.ast.indexer import ASTIndexer, KnowledgeGraph
         db = sample_file.parent / "graph.db"
         graph = KnowledgeGraph(str(db))
         indexer = ASTIndexer(graph)
@@ -210,7 +206,6 @@ class TestAstQuery:
 
     def test_ast_query_unknown_keyword(self, sample_file: Path) -> None:
         pytest.importorskip("tree_sitter")
-        from codeforge_mcp.ast.indexer import ASTIndexer, KnowledgeGraph
         db = sample_file.parent / "graph.db"
         graph = KnowledgeGraph(str(db))
         indexer = ASTIndexer(graph)

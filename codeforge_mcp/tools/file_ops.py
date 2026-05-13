@@ -242,10 +242,10 @@ def list_directory(
             # that live outside the project via symlink traversal.
             try:
                 resolved = entry.resolve()
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError) as e:
                 # Could not resolve (broken symlink, permission error, etc.) — skip.
                 logging.getLogger(__name__).debug(
-                    "Skipping unresolvable entry %s: %s", entry, entry
+                    "Skipping unresolvable entry %s: %s", entry, e
                 )
                 continue
 

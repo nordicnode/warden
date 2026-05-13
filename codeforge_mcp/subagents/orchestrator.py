@@ -54,7 +54,7 @@ MIN_AGENT_BUDGET = 500
 
 # ── Token Estimation ─────────────────────────────────────────────────────────
 
-_encoder: "tiktoken.Encoding" | None = None
+_encoder: "tiktoken.Encoding | None" = None
 
 
 def _get_encoder() -> "tiktoken.Encoding | None":
