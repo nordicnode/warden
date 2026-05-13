@@ -1134,12 +1134,11 @@ async def test_run_affected(
         if not fname:
             continue
         
-        # Heuristic for test files: regex on stem + standard test directory conventions
+        # Heuristic for test files: regex on path string + standard test directory conventions
         p = Path(fname)
-        stem_lower = p.stem.lower()
         path_str = str(p).replace(os.sep, "/")
         is_test = (
-            _IS_TEST_PATTERN.search(stem_lower) is not None
+            _IS_TEST_PATTERN.search(path_str) is not None
             or "/tests/" in path_str
             or "/test/" in path_str
             or "/__tests__/" in path_str

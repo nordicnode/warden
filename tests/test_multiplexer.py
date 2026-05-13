@@ -14,6 +14,7 @@ Bug #2: diagnostics() sent didOpen/didClose as _lsp_request (with id),
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest

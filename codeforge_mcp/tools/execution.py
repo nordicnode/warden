@@ -122,17 +122,13 @@ async def bash_run(
         os.close(rc_fd)
         rc_fd = None
         env["RIPGREP_CONFIG_PATH"] = rc_path
-    finally:
+    except Exception:
         if rc_fd is not None:
             try:
                 os.close(rc_fd)
             except OSError:
                 pass
-        if rc_path is not None:
-            try:
-                os.unlink(rc_path)
-            except OSError:
-                pass
+        raise
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -172,7 +168,7 @@ async def bash_run(
                 duration_ms=duration_ms,
             )
 
-        return {
+        result = {
             "exit_code": exit_code,
             "stdout": stdout_bytes.decode(errors="replace")[:10000],
             "stderr": stderr_bytes.decode(errors="replace")[:10000],
@@ -181,6 +177,15 @@ async def bash_run(
             "dangerous": bool(dangers),
             "confirmation_required": False,
         }
+
+        # Clean up temp ripgrep config file after subprocess completes
+        if rc_path is not None:
+            try:
+                os.unlink(rc_path)
+            except OSError:
+                pass
+
+        return result
     except FileNotFoundError:
         duration_ms = (time.time() - t0) * 1000
         if dangers:
@@ -192,7 +197,7 @@ async def bash_run(
                 exit_code=127,
                 duration_ms=duration_ms,
             )
-        return {
+        result = {
             "exit_code": 127,
             "stdout": "",
             "stderr": f"Command not found: {actual_cmd[0]}",
@@ -201,6 +206,15 @@ async def bash_run(
             "dangerous": bool(dangers),
             "confirmation_required": False,
         }
+
+        # Clean up temp ripgrep config file on error
+        if rc_path is not None:
+            try:
+                os.unlink(rc_path)
+            except OSError:
+                pass
+
+        return result
 
 
 def _build_sandbox_command(cmd: str, cwd: Path, project_root: str | None) -> list[str] | None:

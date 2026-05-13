@@ -142,6 +142,8 @@ class _ServerState:
         # its first workspace crawl (Phase 3 fix — addresses cold-start
         # empty results from pyright et al.).
         self.initialized_at: float = 0.0
+        # Background tasks for server→client responses. Stored to prevent GC.
+        self._response_tasks: set[asyncio.Task[None]] = set()
 
 
 class LSPMultiplexer:
@@ -306,6 +308,16 @@ class LSPMultiplexer:
         if remaining > 0:
             await asyncio.sleep(remaining)
 
+    def _spawn_response_task(self, state: _ServerState, req_id: int, result: Any) -> None:
+        """Spawn a background task for sending a server→client response.
+
+        Stores the task in state._response_tasks to prevent garbage collection,
+        and removes it when done.
+        """
+        task = asyncio.create_task(self._send_response(state, req_id, result))
+        state._response_tasks.add(task)
+        task.add_done_callback(lambda t: state._response_tasks.discard(t))
+
     def _handle_server_request(self, state: _ServerState, method: str, req_id: int, params: Any) -> None:
         """Handle a server→client request and send back the appropriate response."""
         if method == "workspace/configuration":
@@ -313,24 +325,24 @@ class LSPMultiplexer:
             # Respond with null for each item (no custom config is available).
             items = params.get("items", []) if isinstance(params, dict) else []
             result = [None] * len(items) if items else []
-            asyncio.create_task(self._send_response(state, req_id, result))
+            self._spawn_response_task(state, req_id, result)
         elif method == "client/registerCapability":
             # client/registerCapability is sent by the server to register
             # dynamic capabilities. Acknowledge with an empty response.
-            asyncio.create_task(self._send_response(state, req_id, {}))
+            self._spawn_response_task(state, req_id, {})
         elif method == "window/workDoneProgress/create":
             # window/workDoneProgress/create requests a progress token.
             # Acknowledge with the created token.
             token = params.get("token", 0) if isinstance(params, dict) else 0
-            asyncio.create_task(self._send_response(state, req_id, {"token": token}))
+            self._spawn_response_task(state, req_id, {"token": token})
         elif method == "window/showMessageRequest":
             # window/showMessageRequest asks the client to show a message
             # with action items. Respond with null (no action taken).
-            asyncio.create_task(self._send_response(state, req_id, None))
+            self._spawn_response_task(state, req_id, None)
         else:
             # Unknown or unimplemented request — acknowledge with null
             # to prevent the server from hanging on an unhandled request.
-            asyncio.create_task(self._send_response(state, req_id, None))
+            self._spawn_response_task(state, req_id, None)
 
     async def _reader_loop(self, state: _ServerState) -> None:
         """Single reader task: read all messages from stdout and dispatch.
@@ -531,10 +543,12 @@ class LSPMultiplexer:
             # File is already open via _ensure_document_open (e.g., from hover).
             # Send a didChange to refresh the server's view with current content
             # instead of sending a duplicate didOpen which some LSP servers reject.
+            # Increment and persist the version before sending.
+            state._opened_uris_versions[uri] = state._opened_uris_versions.get(uri, 1) + 1
             await self._lsp_notify(state, "textDocument/didChange", {
                 "textDocument": {
                     "uri": uri,
-                    "version": state._opened_uris_versions.get(uri, 1) + 1,
+                    "version": state._opened_uris_versions[uri],
                 },
                 "contentChanges": [
                     {"text": content}
@@ -553,8 +567,6 @@ class LSPMultiplexer:
             })
             state._opened_uris.add(uri)
             # Track the version for subsequent didChange calls
-            if not hasattr(state, "_opened_uris_versions"):
-                state._opened_uris_versions = {}
             state._opened_uris_versions[uri] = 1
 
         # Wait for the publishDiagnostics notification.
@@ -573,8 +585,7 @@ class LSPMultiplexer:
                 "textDocument": {"uri": uri},
             })
             state._opened_uris.discard(uri)
-            if hasattr(state, "_opened_uris_versions"):
-                state._opened_uris_versions.pop(uri, None)
+            state._opened_uris_versions.pop(uri, None)
 
         # Cleanup
         state.diag_events.pop(uri, None)
@@ -979,13 +990,13 @@ class LSPMultiplexer:
     def clear_cache(self, file_uri: str | None = None) -> None:
         """Clear the LSP result cache.
 
+        Clears the entire cache regardless of file_uri (any file edit can
+        affect symbol results, workspace symbols, and references).
+        Also resets the active-languages set so the next symbol_lookup
+        call rediscovers the project.
+
         Args:
-            file_uri: If provided, clear the ENTIRE cache. Any file edit can
-                      affect symbol results (new/removed definitions), workspace
-                      symbols, and references — micro-optimizing which entries
-                      to invalidate is error-prone. If None (default), also
-                      clears the entire cache and resets the active-languages
-                      set so the next symbol_lookup call rediscovers the project.
+            file_uri: Ignored (kept for backward compatibility).
         """
         self._cache.clear()
         if hasattr(self, "_active_langs"):

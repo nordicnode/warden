@@ -16,6 +16,10 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import tiktoken
 
 # Compiled once — used to identify test files without false positives like
 # contest.py, authentication.py, latest_results.py, fastest.py, etc.
@@ -54,7 +58,7 @@ MIN_AGENT_BUDGET = 500
 
 # ── Token Estimation ─────────────────────────────────────────────────────────
 
-_encoder: "tiktoken.Encoding" | None = None
+_encoder: "tiktoken.Encoding | None" = None
 
 
 def _get_encoder() -> "tiktoken.Encoding | None":
@@ -193,16 +197,6 @@ def _fallback_task(task: str) -> str:
                 }}
     fallback_word = list(keywords)[-1] if keywords else task
     return fallback_word
-
-
-def _register_capability(name: str, handler: Callable[..., Awaitable[SubAgentResult]],
-                         produces: set[str], consumes: set[str] | None = None) -> None:
-    _CAPABILITY_REGISTRY[name] = Capability(
-        name=name,
-        handler=handler,
-        produces=produces,
-        consumes=consumes or set(),
-    )
 
 
 # ── Result Types ─────────────────────────────────────────────────────────────
