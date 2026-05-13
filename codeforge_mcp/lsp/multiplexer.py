@@ -225,13 +225,25 @@ class LSPMultiplexer:
         if lang in self._states:
             state = self._states[lang]
             if state.proc.returncode is not None:
-                # Clean up dead server state: cancel reader, cancel pending futures
+                # Clean up dead server state: cancel reader, cancel pending futures, cancel response tasks
                 if state.reader_task is not None:
                     state.reader_task.cancel()
                 for future in state.pending.values():
                     if not future.done():
                         future.cancel()
                 state.pending.clear()
+                # Cancel and drain all response tasks
+                for task in list(state._response_tasks):
+                    task.cancel()
+                # Await each task to consume exceptions
+                for task in list(state._response_tasks):
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
+                state._response_tasks.clear()
                 del self._states[lang]
             else:
                 return state
@@ -316,7 +328,16 @@ class LSPMultiplexer:
         """
         task = asyncio.create_task(self._send_response(state, req_id, result))
         state._response_tasks.add(task)
-        task.add_done_callback(lambda t: state._response_tasks.discard(t))
+        def _done_callback(t: asyncio.Task[None]) -> None:
+            state._response_tasks.discard(t)
+            # Consume exception to prevent "Task exception was never retrieved"
+            try:
+                t.exception()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        task.add_done_callback(_done_callback)
 
     def _handle_server_request(self, state: _ServerState, method: str, req_id: int, params: Any) -> None:
         """Handle a server→client request and send back the appropriate response."""
@@ -1015,5 +1036,16 @@ class LSPMultiplexer:
             finally:
                 if state.reader_task is not None:
                     state.reader_task.cancel()
+                # Cancel and drain all response tasks
+                for task in list(state._response_tasks):
+                    task.cancel()
+                for task in list(state._response_tasks):
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
+                state._response_tasks.clear()
         self._states.clear()
         self._cache.clear()
