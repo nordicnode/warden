@@ -122,13 +122,12 @@ async def bash_run(
         os.close(rc_fd)
         rc_fd = None
         env["RIPGREP_CONFIG_PATH"] = rc_path
-    except Exception:
+    finally:
         if rc_fd is not None:
             try:
                 os.close(rc_fd)
             except OSError:
                 pass
-        raise
 
     try:
         proc = await asyncio.create_subprocess_exec(
